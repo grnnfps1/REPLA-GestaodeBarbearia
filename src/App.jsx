@@ -1,48 +1,29 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
+import { supabase } from "./supabaseClient";
 
-const BARBERS = [
-  {
-    id: "b1",
-    name: "Rafael Moretti",
-    photo: "https://i.pravatar.cc/400?img=12",
-    role: "Barbeiro-chefe",
-    bio: "Doze anos de navalha. Especialista em fade e barba desenhada. Cada corte é um projeto.",
-    specialties: ["Fade", "Barba", "Navalhado"],
-    instagram: "rafa.moretti",
-    whatsapp: "5521999990001",
-    services: ["s1", "s2", "s3", "s5"],
-  },
-  {
-    id: "b2",
-    name: "Diego Antunes",
-    photo: "https://i.pravatar.cc/400?img=33",
-    role: "Barbeiro",
-    bio: "Clássico com precisão. Tesoura, máquina e um olhar apurado para o formato do rosto.",
-    specialties: ["Clássico", "Tesoura", "Pigmentação"],
-    instagram: "diego.antunes",
-    whatsapp: "5521999990002",
-    services: ["s1", "s2", "s4"],
-  },
-  {
-    id: "b3",
-    name: "Léo Vasques",
-    photo: "https://i.pravatar.cc/400?img=51",
-    role: "Barbeiro",
-    bio: "Do corte social ao freestyle. Rápido, limpo e sempre no ritmo certo.",
-    specialties: ["Social", "Freestyle", "Sobrancelha"],
-    instagram: "leo.vasques",
-    whatsapp: "5521999990003",
-    services: ["s1", "s3", "s5"],
-  },
-];
+// As colunas do banco (em português) viram exatamente os campos que a tela
+// já usava, para que o visual continue idêntico.
+function mapBarber(row) {
+  return {
+    id: row.id,
+    nome: row.nome,
+    foto_url: row.foto_url,
+    bio: row.bio || "",
+    especialidades: row.especialidades || [],
+    instagram: row.instagram || "",
+    whatsapp: row.whatsapp || "",
+  };
+}
 
-const SERVICES = [
-  { id: "s1", name: "Corte", desc: "Máquina e tesoura, finalização completa", price: 60, min: 40 },
-  { id: "s2", name: "Corte + Barba", desc: "O combo completo, do zero ao acabamento", price: 95, min: 70 },
-  { id: "s3", name: "Barba", desc: "Toalha quente, navalha e óleo", price: 45, min: 30 },
-  { id: "s4", name: "Pezinho / Acabamento", desc: "Manutenção rápida entre cortes", price: 25, min: 15 },
-  { id: "s5", name: "Navalhado", desc: "Contornos e desenhos na navalha", price: 40, min: 30 },
-];
+function mapService(row) {
+  return {
+    id: row.id,
+    nome: row.nome,
+    descricao: row.descricao || "",
+    preco: row.preco,
+    duracao_min: row.duracao_min,
+  };
+}
 
 const TODAY_APPTS = [
   { time: "09:30", client: "Bruno Salles", phone: "(21) 98812-4410", barber: "Rafael Moretti", service: "Corte + Barba", status: "confirmado" },
@@ -281,6 +262,9 @@ const CSS = `
 .au-badge.ok { color: #a8d5a0; background: rgba(120,190,110,0.12); border: 1px solid rgba(120,190,110,0.25); }
 .au-badge.pend { color: var(--gold-soft); background: rgba(201,163,91,0.1); border: 1px solid var(--line); }
 
+.au-note { color: var(--taupe); font-size: 14px; line-height: 1.6; padding: 18px 6px; }
+.au-note.err { color: var(--gold-soft); }
+
 @media (max-width: 520px){
   .au-appt { grid-template-columns: 60px 1fr; }
   .au-appt .au-badge { grid-column: 2; justify-self: start; margin-top: 4px; }
@@ -300,6 +284,38 @@ export default function App() {
   const [booking, setBooking] = useState(null);
   const [authed, setAuthed] = useState(false);
 
+  // Dados vindos do Supabase (antes eram listas fixas no código).
+  const [barbers, setBarbers] = useState([]);
+  const [services, setServices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      // As duas buscas vão juntas para a tela abrir mais rápido.
+      const [barbersRes, servicesRes] = await Promise.all([
+        supabase.from("barbers").select("*").eq("ativo", true).order("criado_em"),
+        supabase.from("services").select("*").eq("ativo", true).order("criado_em"),
+      ]);
+
+      if (cancelled) return;
+
+      const err = barbersRes.error || servicesRes.error;
+      if (err) {
+        setLoadError(err.message);
+      } else {
+        setBarbers(barbersRes.data.map(mapBarber));
+        setServices(servicesRes.data.map(mapService));
+      }
+      setLoading(false);
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
   const days = useMemo(() => nextDays(14), []);
   const slots = useMemo(() => slotsFor(), []);
 
@@ -307,9 +323,10 @@ export default function App() {
     setBooking({ step: barberId ? 1 : 0, barber: barberId, service: null, date: 0, time: null, name: "", phone: "" });
 
   const b = booking;
-  const barberObj = b?.barber ? BARBERS.find((x) => x.id === b.barber) : null;
-  const serviceObj = b?.service ? SERVICES.find((x) => x.id === b.service) : null;
-  const availServices = barberObj ? SERVICES.filter((s) => barberObj.services.includes(s.id)) : SERVICES;
+  const barberObj = b?.barber ? barbers.find((x) => x.id === b.barber) : null;
+  const serviceObj = b?.service ? services.find((x) => x.id === b.service) : null;
+  // Quem faz o quê virá da tabela barber_services num próximo passo.
+  const availServices = services;
 
   const steps = ["Profissional", "Serviço", "Data e horário", "Seus dados", "Pronto"];
 
@@ -345,24 +362,26 @@ export default function App() {
               <h2 className="au-serif">Nossa equipe</h2>
               <p>Cada profissional tem sua assinatura. Escolha por estilo — ou por quem já é seu barbeiro de confiança.</p>
             </div>
+            {loading && <div className="au-note">Carregando equipe…</div>}
+            {loadError && <div className="au-note err">Não foi possível carregar a equipe: {loadError}</div>}
             <div className="au-barbers">
-              {BARBERS.map((bb) => (
+              {barbers.map((bb) => (
                 <article className="au-bcard" key={bb.id}>
                   <div className="au-bphoto">
-                    <span className="au-brole">{bb.role}</span>
-                    <img src={bb.photo} alt={bb.name} />
+                    <span className="au-brole">Barbeiro</span>
+                    <img src={bb.foto_url} alt={bb.nome} />
                   </div>
                   <div className="au-bbody">
-                    <div className="au-bname au-serif">{bb.name}</div>
+                    <div className="au-bname au-serif">{bb.nome}</div>
                     <p className="au-bbio">{bb.bio}</p>
                     <div className="au-tags">
-                      {bb.specialties.map((s) => <span className="au-tag" key={s}>{s}</span>)}
+                      {bb.especialidades.map((s) => <span className="au-tag" key={s}>{s}</span>)}
                     </div>
                     <div className="au-social">
                       <a href={`https://instagram.com/${bb.instagram}`} target="_blank" rel="noreferrer"><Icon name="insta" /> @{bb.instagram}</a>
                       <a href={`https://wa.me/${bb.whatsapp}`} target="_blank" rel="noreferrer"><Icon name="wa" /> WhatsApp</a>
                     </div>
-                    <button className="au-btn au-bbook" onClick={() => startBooking(bb.id)}>Agendar com {bb.name.split(" ")[0]}</button>
+                    <button className="au-btn au-bbook" onClick={() => startBooking(bb.id)}>Agendar com {bb.nome.split(" ")[0]}</button>
                   </div>
                 </article>
               ))}
@@ -374,16 +393,17 @@ export default function App() {
               <h2 className="au-serif">Serviços</h2>
               <p>Preços justos, tempo reservado só para você. Sem fila, sem espera.</p>
             </div>
+            {loading && <div className="au-note">Carregando serviços…</div>}
             <div className="au-menu">
-              {SERVICES.map((s) => (
+              {services.map((s) => (
                 <div className="au-srow" key={s.id}>
                   <div>
-                    <div className="au-sname au-serif">{s.name}</div>
-                    <div className="au-sdesc">{s.desc}</div>
+                    <div className="au-sname au-serif">{s.nome}</div>
+                    <div className="au-sdesc">{s.descricao}</div>
                   </div>
                   <div className="au-smeta">
-                    <div className="au-sprice au-serif">R$ {s.price}</div>
-                    <div className="au-smin">{s.min} min</div>
+                    <div className="au-sprice au-serif">R$ {s.preco}</div>
+                    <div className="au-smin">{s.duracao_min} min</div>
                   </div>
                 </div>
               ))}
@@ -422,7 +442,7 @@ export default function App() {
               <div className="au-stat"><div className="n">{TODAY_APPTS.length}</div><div className="l">Agendamentos hoje</div></div>
               <div className="au-stat"><div className="n">R$ 325</div><div className="l">Faturamento previsto</div></div>
               <div className="au-stat"><div className="n">{TODAY_APPTS.filter(a=>a.status==="pendente").length}</div><div className="l">Aguardando confirmação</div></div>
-              <div className="au-stat"><div className="n">3</div><div className="l">Barbeiros ativos</div></div>
+              <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
             <div className="au-appts">
               {TODAY_APPTS.map((a, i) => (
@@ -454,12 +474,12 @@ export default function App() {
               <button className="au-x" onClick={() => setBooking(null)}>✕</button>
             </div>
             <div className="au-sheet-body">
-              {b.step === 0 && BARBERS.map((bb) => (
+              {b.step === 0 && barbers.map((bb) => (
                 <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, service: null, step: 1 })}>
-                  <img src={bb.photo} alt="" />
+                  <img src={bb.foto_url} alt="" />
                   <div className="au-pick-main">
-                    <div className="au-pick-t">{bb.name}</div>
-                    <div className="au-pick-s">{bb.specialties.join(" · ")}</div>
+                    <div className="au-pick-t">{bb.nome}</div>
+                    <div className="au-pick-s">{bb.especialidades.join(" · ")}</div>
                   </div>
                 </button>
               ))}
@@ -467,10 +487,10 @@ export default function App() {
               {b.step === 1 && availServices.map((s) => (
                 <button className="au-pick" key={s.id} onClick={() => setBooking({ ...b, service: s.id, step: 2 })}>
                   <div className="au-pick-main">
-                    <div className="au-pick-t">{s.name}</div>
-                    <div className="au-pick-s">{s.min} min · {s.desc}</div>
+                    <div className="au-pick-t">{s.nome}</div>
+                    <div className="au-pick-s">{s.duracao_min} min · {s.descricao}</div>
                   </div>
-                  <div className="au-pick-p au-serif">R$ {s.price}</div>
+                  <div className="au-pick-p au-serif">R$ {s.preco}</div>
                 </button>
               ))}
 
@@ -497,10 +517,10 @@ export default function App() {
               {b.step === 3 && (
                 <>
                   <div className="au-summary">
-                    <div className="au-sumrow"><span>Profissional</span><span>{barberObj?.name}</span></div>
-                    <div className="au-sumrow"><span>Serviço</span><span>{serviceObj?.name}</span></div>
+                    <div className="au-sumrow"><span>Profissional</span><span>{barberObj?.nome}</span></div>
+                    <div className="au-sumrow"><span>Serviço</span><span>{serviceObj?.nome}</span></div>
                     <div className="au-sumrow"><span>Quando</span><span>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} · {b.time}</span></div>
-                    <div className="au-sumrow total"><span>Total</span><span>R$ {serviceObj?.price}</span></div>
+                    <div className="au-sumrow total"><span>Total</span><span>R$ {serviceObj?.preco}</span></div>
                   </div>
                   <div className="au-field"><label>Seu nome</label><input value={b.name} onChange={(e) => setBooking({ ...b, name: e.target.value })} placeholder="Como devemos te chamar?" /></div>
                   <div className="au-field"><label>Telefone / WhatsApp</label><input value={b.phone} onChange={(e) => setBooking({ ...b, phone: e.target.value })} placeholder="(21) 90000-0000" /></div>
@@ -512,7 +532,7 @@ export default function App() {
                 <div className="au-done">
                   <div className="au-check">✓</div>
                   <h3 className="au-serif">Horário reservado</h3>
-                  <p>{b.name.split(" ")[0]}, seu {serviceObj?.name.toLowerCase()} com {barberObj?.name.split(" ")[0]} está marcado para <strong style={{ color: "var(--cream)" }}>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} às {b.time}</strong>. Enviaremos um lembrete no WhatsApp.</p>
+                  <p>{b.name.split(" ")[0]}, seu {serviceObj?.nome.toLowerCase()} com {barberObj?.nome.split(" ")[0]} está marcado para <strong style={{ color: "var(--cream)" }}>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} às {b.time}</strong>. Enviaremos um lembrete no WhatsApp.</p>
                   <button className="au-btn" style={{ marginTop: 26 }} onClick={() => setBooking(null)}>Concluir</button>
                 </div>
               )}
