@@ -1,5 +1,44 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./supabaseClient";
+
+// Trava o scroll da página de fundo enquanto um overlay está aberto.
+// `overflow: hidden` no body sozinho NÃO segura o iOS Safari — lá é preciso
+// tirar o body do fluxo com position: fixed. Como isso joga a página para o
+// topo, guardamos a posição e devolvemos exatamente onde estava ao fechar.
+function useScrollLock(ativo) {
+  useEffect(() => {
+    if (!ativo) return;
+
+    const body = document.body;
+    const posicaoY = window.scrollY;
+    const anterior = {
+      position: body.style.position,
+      top: body.style.top,
+      left: body.style.left,
+      right: body.style.right,
+      width: body.style.width,
+      overflow: body.style.overflow,
+    };
+
+    body.style.position = "fixed";
+    body.style.top = `-${posicaoY}px`;
+    body.style.left = "0";
+    body.style.right = "0";
+    body.style.width = "100%";
+    body.style.overflow = "hidden";
+
+    return () => {
+      body.style.position = anterior.position;
+      body.style.top = anterior.top;
+      body.style.left = anterior.left;
+      body.style.right = anterior.right;
+      body.style.width = anterior.width;
+      body.style.overflow = anterior.overflow;
+      // Volta para onde o dedo tinha parado, sem animação.
+      window.scrollTo(0, posicaoY);
+    };
+  }, [ativo]);
+}
 
 // As colunas do banco (em português) viram exatamente os campos que a tela
 // já usava, para que o visual continue idêntico.
@@ -231,6 +270,9 @@ const CSS = `
 .au-sheet {
   background: var(--espresso); border: 1px solid var(--line); border-radius: 22px 22px 0 0;
   width: 100%; max-width: 560px; max-height: 92vh; overflow-y: auto;
+  /* Impede que o scroll "vaze" para o fundo ao chegar no fim da folha. */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 @media (min-width: 720px){ .au-sheet { border-radius: 22px; } }
 .au-sheet-head { position: sticky; top: 0; background: var(--espresso); padding: 20px 24px; border-bottom: 1px solid var(--line-soft); display: flex; align-items: center; justify-content: space-between; }
@@ -370,7 +412,7 @@ export default function App() {
 
   // Agenda real da área de gestão (só carrega para quem está logado).
   const [appts, setAppts] = useState([]);
-  const [apptsLoading, setApptsLoading] = useState(false);
+  const [apptsLoading, setApptsLoading] = useState(true);
   const [apptsError, setApptsError] = useState(null);
 
   // Busca por telefone. O histórico completo (incluindo passados) só é baixado
@@ -400,32 +442,62 @@ export default function App() {
   // renovação de token, e isso refaria a busca sem necessidade.
   const userId = session?.user?.id ?? null;
 
+  // Guarda o instante da última busca, para dois eventos quase simultâneos
+  // (visibilitychange + focus) não dispararem duas consultas.
+  const ultimaCargaRef = useRef(0);
+
+  // "Carregando" só existe até a primeira carga terminar: o estado começa em
+  // true e nunca volta a true. Assim as atualizações em segundo plano trocam
+  // os dados sem a lista piscar embaixo do dono enquanto ele lê.
+  const loadAppts = useCallback(async () => {
+    if (!userId) return;
+
+    ultimaCargaRef.current = Date.now();
+
+    // O JOIN traz o nome do barbeiro e nome+preço do serviço numa só ida.
+    const { data, error } = await supabase
+      .from("appointments")
+      .select("*, barbers(nome), services(nome, preco)")
+      .gte("data_hora", inicioDoDiaBR())
+      .order("data_hora", { ascending: true });
+
+    if (error) setApptsError(error.message);
+    else {
+      setAppts(data);
+      setApptsError(null);
+    }
+    setApptsLoading(false);
+  }, [userId]);
+
+  // Carga inicial ao entrar. Envolvida numa função async de propósito: deixa
+  // explícito que nenhum estado muda de forma síncrona dentro do efeito.
+  useEffect(() => {
+    if (!userId) return;
+    void (async () => { await loadAppts(); })();
+  }, [userId, loadAppts]);
+
+  // Mantém a agenda fresca sem F5: quando a aba volta a ficar visível ou ganha
+  // foco, e a cada 45s enquanto estiver visível.
   useEffect(() => {
     if (!userId) return;
 
-    let cancelled = false;
+    const atualizar = () => {
+      if (document.visibilityState !== "visible") return;
+      // Nunca duas consultas em menos de 5 segundos.
+      if (Date.now() - ultimaCargaRef.current < 5000) return;
+      loadAppts();
+    };
 
-    async function loadAppts() {
-      setApptsLoading(true);
-      setApptsError(null);
+    document.addEventListener("visibilitychange", atualizar);
+    window.addEventListener("focus", atualizar);
+    const intervalo = setInterval(atualizar, 45000);
 
-      // O JOIN traz o nome do barbeiro e nome+preço do serviço numa só ida.
-      const { data, error } = await supabase
-        .from("appointments")
-        .select("*, barbers(nome), services(nome, preco)")
-        .gte("data_hora", inicioDoDiaBR())
-        .order("data_hora", { ascending: true });
-
-      if (cancelled) return;
-
-      if (error) setApptsError(error.message);
-      else setAppts(data);
-      setApptsLoading(false);
-    }
-
-    loadAppts();
-    return () => { cancelled = true; };
-  }, [userId]);
+    return () => {
+      document.removeEventListener("visibilitychange", atualizar);
+      window.removeEventListener("focus", atualizar);
+      clearInterval(intervalo);
+    };
+  }, [userId, loadAppts]);
 
   // Baixa o histórico completo uma única vez, na primeira busca da sessão.
   // Enquanto o campo estiver vazio, nada disso roda.
@@ -485,6 +557,8 @@ export default function App() {
     setAppts([]);
     setHistorico(null);
     setBusca("");
+    // Volta ao estado de "primeira carga" para o próximo login.
+    setApptsLoading(true);
   }
 
   useEffect(() => {
@@ -512,6 +586,11 @@ export default function App() {
     load();
     return () => { cancelled = true; };
   }, []);
+
+  // Trava o fundo enquanto o modal de agendamento está aberto. Depende do
+  // booleano, não do objeto booking — senão a trava se refaria a cada tecla
+  // digitada no formulário e a página pularia.
+  useScrollLock(booking !== null);
 
   const days = useMemo(() => nextDays(14), []);
   const slots = useMemo(() => slotsFor(), []);
