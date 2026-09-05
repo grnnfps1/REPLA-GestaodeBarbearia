@@ -38,7 +38,8 @@ IMPORTANTE: o bloqueio de horário duplo deve ser garantido no banco (constraint
 ## Estado atual do projeto
 - Projeto React + Vite criado e rodando em localhost:5173
 - src/App.jsx já contém a base visual completa (app cliente + área de gestão) com dados FALSOS (em memória), incluindo: hero, cards de barbeiros, cardápio de serviços, fluxo de agendamento em 4 passos, login simulado e agenda do dia.
-- src/index.css está vazio de propósito.
+- src/index.css contém APENAS a base mínima (html/body/#root a 100% de largura e fundo espresso). Todo o visual vive no bloco CSS dentro de src/App.jsx. O CSS de fábrica do Vite foi removido (limitava #root a 1126px) e src/App.css foi apagado por ser código morto.
+- Layout pretendido: a página ocupa 100% da largura; só as seções internas (.au-sec, .au-dash) têm max-width de 1080px centralizado.
 - Já versionado no GitHub: github.com/grnnfps1/REPLA-GestaodeBarbearia
 - PRÓXIMO PASSO: conectar o Supabase para os dados serem reais.
 

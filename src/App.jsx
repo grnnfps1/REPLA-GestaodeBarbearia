@@ -25,16 +25,50 @@ function mapService(row) {
   };
 }
 
-const TODAY_APPTS = [
-  { time: "09:30", client: "Bruno Salles", phone: "(21) 98812-4410", barber: "Rafael Moretti", service: "Corte + Barba", status: "confirmado" },
-  { time: "10:40", client: "André Lima", phone: "(21) 99640-2231", barber: "Diego Antunes", service: "Corte", status: "confirmado" },
-  { time: "11:30", client: "Marcos Vinícius", phone: "(21) 98120-7788", barber: "Rafael Moretti", service: "Barba", status: "pendente" },
-  { time: "14:00", client: "Felipe Rocha", phone: "(21) 99903-1120", barber: "Léo Vasques", service: "Corte", status: "confirmado" },
-  { time: "15:30", client: "Thiago Nunes", phone: "(21) 98450-9987", barber: "Rafael Moretti", service: "Navalhado", status: "confirmado" },
-];
 
 const WEEKDAYS = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
 const MONTHS = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+
+// Junta a data escolhida com o horário escolhido num timestamp com fuso
+// explícito de Brasília (-03:00). Fixamos o fuso da barbearia em vez de usar
+// o do celular do cliente: se alguém agendar viajando, o horário continua
+// sendo o da loja. O Brasil não usa horário de verão desde 2019, então -03:00
+// não muda ao longo do ano.
+function toTimestampBR(date, time) {
+  const ano = date.getFullYear();
+  const mes = String(date.getMonth() + 1).padStart(2, "0");
+  const dia = String(date.getDate()).padStart(2, "0");
+  return `${ano}-${mes}-${dia}T${time}:00-03:00`;
+}
+
+// O banco devolve o instante em UTC. Estas funções trazem para o horário da
+// barbearia usando o MESMO deslocamento fixo do toTimestampBR, para que gravar
+// e ler nunca discordem.
+const OFFSET_BR_MS = 3 * 60 * 60 * 1000;
+
+function paraBrasilia(iso) {
+  return new Date(new Date(iso).getTime() - OFFSET_BR_MS);
+}
+
+function formatHoraBR(iso) {
+  const b = paraBrasilia(iso);
+  return `${String(b.getUTCHours()).padStart(2, "0")}:${String(b.getUTCMinutes()).padStart(2, "0")}`;
+}
+
+function chaveDiaBR(iso) {
+  const b = paraBrasilia(iso);
+  return `${b.getUTCFullYear()}-${String(b.getUTCMonth() + 1).padStart(2, "0")}-${String(b.getUTCDate()).padStart(2, "0")}`;
+}
+
+function formatDiaCurtoBR(iso) {
+  const b = paraBrasilia(iso);
+  return `${b.getUTCDate()} ${MONTHS[b.getUTCMonth()]}`;
+}
+
+// Meia-noite de hoje na barbearia, independente do fuso de quem abre a tela.
+function inicioDoDiaBR() {
+  return `${chaveDiaBR(new Date().toISOString())}T00:00:00-03:00`;
+}
 
 function nextDays(n) {
   const out = [];
@@ -197,6 +231,12 @@ const CSS = `
 .au-x:hover { border-color: var(--gold); }
 .au-sheet-body { padding: 22px 24px 28px; }
 
+.au-alert {
+  background: rgba(201,163,91,0.08); border: 1px solid var(--line); border-radius: 12px;
+  padding: 13px 15px; margin-bottom: 16px;
+  color: var(--gold-soft); font-size: 13.5px; line-height: 1.5;
+}
+
 .au-pick { display: flex; align-items: center; gap: 14px; width: 100%; text-align: left; cursor: pointer;
   background: var(--surface); border: 1px solid var(--line-soft); border-radius: 14px; padding: 14px; margin-bottom: 10px; transition: border-color .2s, background .2s; color: var(--cream); font-family: inherit; }
 .au-pick:hover { border-color: var(--gold); background: var(--surface-2); }
@@ -282,13 +322,105 @@ function Icon({ name }) {
 export default function App() {
   const [mode, setMode] = useState("client");
   const [booking, setBooking] = useState(null);
-  const [authed, setAuthed] = useState(false);
+  // Sessão real do Supabase Auth. null = deslogado.
+  const [session, setSession] = useState(null);
+  const [checkingSession, setCheckingSession] = useState(true);
+  const [email, setEmail] = useState("");
+  const [senha, setSenha] = useState("");
+  const [signingIn, setSigningIn] = useState(false);
+  const [authError, setAuthError] = useState(null);
 
   // Dados vindos do Supabase (antes eram listas fixas no código).
   const [barbers, setBarbers] = useState([]);
   const [services, setServices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
+
+  // Gravação do agendamento: saving trava o botão, bookingError mostra o aviso.
+  const [saving, setSaving] = useState(false);
+  const [bookingError, setBookingError] = useState(null);
+
+  // Agenda real da área de gestão (só carrega para quem está logado).
+  const [appts, setAppts] = useState([]);
+  const [apptsLoading, setApptsLoading] = useState(false);
+  const [apptsError, setApptsError] = useState(null);
+
+  // Sessão: lê a que já existe (o Supabase guarda no navegador) e depois
+  // fica ouvindo login/logout — inclusive os feitos em outra aba.
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setCheckingSession(false);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((_evento, novaSessao) => {
+      setSession(novaSessao);
+      setCheckingSession(false);
+    });
+
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Só o id do usuário como dependência: a sessão vira um objeto novo a cada
+  // renovação de token, e isso refaria a busca sem necessidade.
+  const userId = session?.user?.id ?? null;
+
+  useEffect(() => {
+    if (!userId) return;
+
+    let cancelled = false;
+
+    async function loadAppts() {
+      setApptsLoading(true);
+      setApptsError(null);
+
+      // O JOIN traz o nome do barbeiro e nome+preço do serviço numa só ida.
+      const { data, error } = await supabase
+        .from("appointments")
+        .select("*, barbers(nome), services(nome, preco)")
+        .gte("data_hora", inicioDoDiaBR())
+        .order("data_hora", { ascending: true });
+
+      if (cancelled) return;
+
+      if (error) setApptsError(error.message);
+      else setAppts(data);
+      setApptsLoading(false);
+    }
+
+    loadAppts();
+    return () => { cancelled = true; };
+  }, [userId]);
+
+  async function handleLogin() {
+    if (signingIn) return;
+    setSigningIn(true);
+    setAuthError(null);
+
+    const { error } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password: senha,
+    });
+
+    setSigningIn(false);
+
+    if (error) {
+      // Mensagem única de propósito: não revelamos se o e-mail existe ou não.
+      setAuthError("E-mail ou senha inválidos.");
+      return;
+    }
+    // Sucesso: o onAuthStateChange acima atualiza a sessão e a tela troca sozinha.
+    setSenha("");
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setEmail("");
+    setSenha("");
+    setAuthError(null);
+    // Não deixa nome e telefone de cliente na memória depois que o dono sai.
+    setAppts([]);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -319,10 +451,56 @@ export default function App() {
   const days = useMemo(() => nextDays(14), []);
   const slots = useMemo(() => slotsFor(), []);
 
-  const startBooking = (barberId = null) =>
+  // Números do topo do dashboard, todos derivados da agenda real.
+  const hojeBR = chaveDiaBR(new Date().toISOString());
+  // Number() protege caso o preço venha como texto do banco.
+  const faturamentoPrevisto = appts.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
+  const aguardandoConfirmacao = appts.filter((a) => a.status !== "confirmado").length;
+
+  const startBooking = (barberId = null) => {
+    setBookingError(null);
     setBooking({ step: barberId ? 1 : 0, barber: barberId, service: null, date: 0, time: null, name: "", phone: "" });
+  };
+
+  const closeBooking = () => {
+    setBooking(null);
+    setBookingError(null);
+    setSaving(false);
+  };
 
   const b = booking;
+
+  // Grava o agendamento no banco. A tela de sucesso só aparece se der certo.
+  async function confirmBooking() {
+    if (saving) return;
+    setSaving(true);
+    setBookingError(null);
+
+    const { error } = await supabase.from("appointments").insert({
+      barber_id: b.barber,
+      service_id: b.service,
+      data_hora: toTimestampBR(days[b.date], b.time),
+      cliente_nome: b.name.trim(),
+      cliente_telefone: b.phone.trim(),
+      status: "confirmado",
+    });
+
+    setSaving(false);
+
+    if (error) {
+      // 23505 = violação de UNIQUE no Postgres. Aqui só pode ser a constraint
+      // (barber_id, data_hora): alguém pegou esse horário primeiro.
+      if (error.code === "23505") {
+        setBookingError("Ops, esse horário acabou de ser reservado. Escolha outro, por favor.");
+        setBooking({ ...b, step: 2, time: null });
+      } else {
+        setBookingError("Não conseguimos concluir seu agendamento agora. Tente de novo em alguns instantes.");
+      }
+      return;
+    }
+
+    setBooking({ ...b, step: 4 });
+  }
   const barberObj = b?.barber ? barbers.find((x) => x.id === b.barber) : null;
   const serviceObj = b?.service ? services.find((x) => x.id === b.service) : null;
   // Quem faz o quê virá da tabela barber_services num próximo passo.
@@ -423,57 +601,72 @@ export default function App() {
           </footer>
         </>
       ) : (
-        !authed ? (
+        checkingSession ? (
+          <div className="au-login">
+            <div className="au-hint">Carregando…</div>
+          </div>
+        ) : !session ? (
           <div className="au-login">
             <h2 className="au-serif">Área de gestão</h2>
             <p>Entre para ver a agenda do dia.</p>
-            <div className="au-field"><label>E-mail</label><input defaultValue="dono@aurea.com" /></div>
-            <div className="au-field"><label>Senha</label><input type="password" defaultValue="12345678" /></div>
-            <button className="au-btn" style={{ width: "100%", justifyContent: "center" }} onClick={() => setAuthed(true)}>Entrar</button>
-            <div className="au-hint">Demo — clique em Entrar para acessar.</div>
+            {authError && <div className="au-alert">{authError}</div>}
+            <div className="au-field"><label>E-mail</label><input type="email" autoComplete="username" placeholder="voce@barbearia.com" value={email} onChange={(e) => setEmail(e.target.value)} /></div>
+            <div className="au-field"><label>Senha</label><input type="password" autoComplete="current-password" placeholder="Sua senha" value={senha} onChange={(e) => setSenha(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") handleLogin(); }} /></div>
+            <button className="au-btn" style={{ width: "100%", justifyContent: "center" }} disabled={!email || !senha || signingIn} onClick={handleLogin}>{signingIn ? "Entrando…" : "Entrar"}</button>
+            <div className="au-hint">Acesso restrito à equipe da barbearia.</div>
           </div>
         ) : (
           <div className="au-dash">
             <div className="au-dash-head">
-              <h2 className="au-serif">Agenda de hoje</h2>
+              <h2 className="au-serif">Agenda</h2>
               <div className="au-dash-date">{WEEKDAYS[new Date().getDay()].toUpperCase()}, {new Date().getDate()} {MONTHS[new Date().getMonth()].toUpperCase()}</div>
             </div>
             <div className="au-stats">
-              <div className="au-stat"><div className="n">{TODAY_APPTS.length}</div><div className="l">Agendamentos hoje</div></div>
-              <div className="au-stat"><div className="n">R$ 325</div><div className="l">Faturamento previsto</div></div>
-              <div className="au-stat"><div className="n">{TODAY_APPTS.filter(a=>a.status==="pendente").length}</div><div className="l">Aguardando confirmação</div></div>
+              <div className="au-stat"><div className="n">{appts.length}</div><div className="l">Próximos agendamentos</div></div>
+              <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">Faturamento previsto</div></div>
+              <div className="au-stat"><div className="n">{aguardandoConfirmacao}</div><div className="l">Aguardando confirmação</div></div>
               <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
+            {apptsError && <div className="au-note err">Não foi possível carregar a agenda: {apptsError}</div>}
             <div className="au-appts">
-              {TODAY_APPTS.map((a, i) => (
-                <div className="au-appt" key={i}>
-                  <div className="au-appt-time au-serif">{a.time}</div>
+              {apptsLoading ? (
+                <div className="au-note" style={{ padding: "22px" }}>Carregando agenda…</div>
+              ) : appts.length === 0 ? (
+                <div className="au-note" style={{ padding: "22px" }}>Nenhum agendamento por aqui ainda.</div>
+              ) : appts.map((a) => (
+                <div className="au-appt" key={a.id}>
+                  <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
                   <div>
-                    <div className="au-appt-client">{a.client}</div>
-                    <div className="au-appt-meta">{a.service} · {a.barber} · {a.phone}</div>
+                    <div className="au-appt-client">{a.cliente_nome}</div>
+                    <div className="au-appt-meta">
+                      {chaveDiaBR(a.data_hora) !== hojeBR && `${formatDiaCurtoBR(a.data_hora)} · `}
+                      {a.services?.nome} · {a.barbers?.nome} · {a.cliente_telefone}
+                    </div>
                   </div>
                   <span className={`au-badge ${a.status === "confirmado" ? "ok" : "pend"}`}>{a.status}</span>
                 </div>
               ))}
             </div>
             <div style={{ textAlign: "center", marginTop: 24 }}>
-              <button className="au-btn au-btn-ghost" onClick={() => setAuthed(false)}>Sair</button>
+              <button className="au-btn au-btn-ghost" onClick={handleLogout}>Sair</button>
             </div>
           </div>
         )
       )}
 
       {b && (
-        <div className="au-ov" onClick={(e) => { if (e.target.classList.contains("au-ov")) setBooking(null); }}>
+        <div className="au-ov" onClick={(e) => { if (e.target.classList.contains("au-ov")) closeBooking(); }}>
           <div className="au-sheet">
             <div className="au-sheet-head">
               <div>
                 <div className="au-step-label">{b.step < 4 ? `Passo ${b.step + 1} de 4` : "Confirmado"}</div>
                 <h3 className="au-serif">{steps[b.step]}</h3>
               </div>
-              <button className="au-x" onClick={() => setBooking(null)}>✕</button>
+              <button className="au-x" onClick={closeBooking}>✕</button>
             </div>
             <div className="au-sheet-body">
+              {bookingError && <div className="au-alert">{bookingError}</div>}
+
               {b.step === 0 && barbers.map((bb) => (
                 <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, service: null, step: 1 })}>
                   <img src={bb.foto_url} alt="" />
@@ -507,7 +700,7 @@ export default function App() {
                   </div>
                   <div className="au-slots">
                     {slots.map((s) => (
-                      <button key={s.t} className={`au-slot ${b.time === s.t ? "sel" : ""}`} disabled={!s.free} onClick={() => setBooking({ ...b, time: s.t })}>{s.t}</button>
+                      <button key={s.t} className={`au-slot ${b.time === s.t ? "sel" : ""}`} disabled={!s.free} onClick={() => { setBookingError(null); setBooking({ ...b, time: s.t }); }}>{s.t}</button>
                     ))}
                   </div>
                   <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 22 }} disabled={!b.time} onClick={() => setBooking({ ...b, step: 3 })}>Continuar</button>
@@ -524,7 +717,7 @@ export default function App() {
                   </div>
                   <div className="au-field"><label>Seu nome</label><input value={b.name} onChange={(e) => setBooking({ ...b, name: e.target.value })} placeholder="Como devemos te chamar?" /></div>
                   <div className="au-field"><label>Telefone / WhatsApp</label><input value={b.phone} onChange={(e) => setBooking({ ...b, phone: e.target.value })} placeholder="(21) 90000-0000" /></div>
-                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 6 }} disabled={!b.name || !b.phone} onClick={() => setBooking({ ...b, step: 4 })}>Confirmar agendamento</button>
+                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 6 }} disabled={!b.name || !b.phone || saving} onClick={confirmBooking}>{saving ? "Confirmando…" : "Confirmar agendamento"}</button>
                 </>
               )}
 
@@ -533,7 +726,7 @@ export default function App() {
                   <div className="au-check">✓</div>
                   <h3 className="au-serif">Horário reservado</h3>
                   <p>{b.name.split(" ")[0]}, seu {serviceObj?.nome.toLowerCase()} com {barberObj?.nome.split(" ")[0]} está marcado para <strong style={{ color: "var(--cream)" }}>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} às {b.time}</strong>. Enviaremos um lembrete no WhatsApp.</p>
-                  <button className="au-btn" style={{ marginTop: 26 }} onClick={() => setBooking(null)}>Concluir</button>
+                  <button className="au-btn" style={{ marginTop: 26 }} onClick={closeBooking}>Concluir</button>
                 </div>
               )}
             </div>
