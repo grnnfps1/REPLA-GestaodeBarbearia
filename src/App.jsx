@@ -62,7 +62,16 @@ function chaveDiaBR(iso) {
 
 function formatDiaCurtoBR(iso) {
   const b = paraBrasilia(iso);
-  return `${b.getUTCDate()} ${MONTHS[b.getUTCMonth()]}`;
+  const anoAtual = paraBrasilia(new Date().toISOString()).getUTCFullYear();
+  const ano = b.getUTCFullYear();
+  // Só mostra o ano quando não é o atual, para o histórico antigo não confundir.
+  return `${b.getUTCDate()} ${MONTHS[b.getUTCMonth()]}${ano !== anoAtual ? ` ${ano}` : ""}`;
+}
+
+// Deixa só os números: "(21) 99742-6418" e "21997426418" viram a mesma coisa,
+// então a busca funciona com ou sem formatação.
+function soDigitos(texto) {
+  return (texto || "").replace(/\D/g, "");
 }
 
 // Meia-noite de hoje na barbearia, independente do fuso de quem abre a tela.
@@ -292,6 +301,25 @@ const CSS = `
 .au-stat .n { font-family: 'Fraunces', serif; font-size: 34px; color: var(--gold-soft); line-height: 1; }
 .au-stat .l { color: var(--taupe); font-size: 12.5px; margin-top: 8px; }
 
+.au-search { position: relative; margin-bottom: 16px; }
+.au-search input {
+  width: 100%; background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 12px; padding: 14px 50px 14px 16px; color: var(--cream);
+  font-family: inherit;
+  /* 16px é proposital: abaixo disso o iOS dá zoom sozinho ao focar o campo. */
+  font-size: 16px;
+}
+.au-search input:focus { outline: none; border-color: var(--gold); }
+.au-search input::placeholder { color: var(--taupe); }
+.au-search-clear {
+  position: absolute; right: 9px; top: 50%; transform: translateY(-50%);
+  width: 34px; height: 34px; border-radius: 50%;
+  background: transparent; border: 1px solid var(--line-soft); color: var(--cream);
+  cursor: pointer; font-size: 14px; line-height: 1;
+  display: grid; place-items: center;
+}
+.au-search-clear:hover { border-color: var(--gold); color: var(--gold-soft); }
+
 .au-appts { background: var(--espresso-2); border: 1px solid var(--line-soft); border-radius: 18px; overflow: hidden; }
 .au-appt { display: grid; grid-template-columns: 76px 1fr auto; align-items: center; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--line-soft); }
 .au-appt:last-child { border-bottom: 0; }
@@ -345,6 +373,13 @@ export default function App() {
   const [apptsLoading, setApptsLoading] = useState(false);
   const [apptsError, setApptsError] = useState(null);
 
+  // Busca por telefone. O histórico completo (incluindo passados) só é baixado
+  // na primeira vez que o dono busca algo — null = ainda não carregado.
+  const [busca, setBusca] = useState("");
+  const [historico, setHistorico] = useState(null);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histError, setHistError] = useState(null);
+
   // Sessão: lê a que já existe (o Supabase guarda no navegador) e depois
   // fica ouvindo login/logout — inclusive os feitos em outra aba.
   useEffect(() => {
@@ -392,6 +427,34 @@ export default function App() {
     return () => { cancelled = true; };
   }, [userId]);
 
+  // Baixa o histórico completo uma única vez, na primeira busca da sessão.
+  // Enquanto o campo estiver vazio, nada disso roda.
+  useEffect(() => {
+    if (!userId || !busca.trim() || historico !== null) return;
+
+    let cancelled = false;
+
+    async function loadHistorico() {
+      setHistLoading(true);
+      setHistError(null);
+
+      const { data, error } = await supabase
+        .from("appointments")
+        .select("*, barbers(nome), services(nome, preco)")
+        .order("data_hora", { ascending: false })
+        .limit(2000);
+
+      if (cancelled) return;
+
+      if (error) setHistError(error.message);
+      else setHistorico(data);
+      setHistLoading(false);
+    }
+
+    loadHistorico();
+    return () => { cancelled = true; };
+  }, [userId, busca, historico]);
+
   async function handleLogin() {
     if (signingIn) return;
     setSigningIn(true);
@@ -420,6 +483,8 @@ export default function App() {
     setAuthError(null);
     // Não deixa nome e telefone de cliente na memória depois que o dono sai.
     setAppts([]);
+    setHistorico(null);
+    setBusca("");
   }
 
   useEffect(() => {
@@ -456,6 +521,15 @@ export default function App() {
   // Number() protege caso o preço venha como texto do banco.
   const faturamentoPrevisto = appts.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
   const aguardandoConfirmacao = appts.filter((a) => a.status !== "confirmado").length;
+
+  // Com busca ativa, a lista sai do histórico completo (passados inclusos).
+  // Com o campo vazio, continua sendo só a agenda de hoje em diante.
+  const buscaDigitos = soDigitos(busca);
+  const buscando = busca.trim() !== "";
+  const listaExibida = buscando
+    ? (historico ?? []).filter((a) => soDigitos(a.cliente_telefone).includes(buscaDigitos))
+    : appts;
+  const listaCarregando = buscando ? histLoading : apptsLoading;
 
   const startBooking = (barberId = null) => {
     setBookingError(null);
@@ -627,13 +701,31 @@ export default function App() {
               <div className="au-stat"><div className="n">{aguardandoConfirmacao}</div><div className="l">Aguardando confirmação</div></div>
               <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
+            <div className="au-search">
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="off"
+                aria-label="Buscar agendamentos por telefone"
+                placeholder="Buscar por telefone (inclui histórico)"
+                value={busca}
+                onChange={(e) => setBusca(e.target.value)}
+              />
+              {busca && (
+                <button className="au-search-clear" aria-label="Limpar busca" onClick={() => setBusca("")}>✕</button>
+              )}
+            </div>
+
             {apptsError && <div className="au-note err">Não foi possível carregar a agenda: {apptsError}</div>}
+            {histError && <div className="au-note err">Não foi possível buscar o histórico: {histError}</div>}
             <div className="au-appts">
-              {apptsLoading ? (
-                <div className="au-note" style={{ padding: "22px" }}>Carregando agenda…</div>
-              ) : appts.length === 0 ? (
-                <div className="au-note" style={{ padding: "22px" }}>Nenhum agendamento por aqui ainda.</div>
-              ) : appts.map((a) => (
+              {listaCarregando ? (
+                <div className="au-note" style={{ padding: "22px" }}>{buscando ? "Buscando…" : "Carregando agenda…"}</div>
+              ) : listaExibida.length === 0 ? (
+                <div className="au-note" style={{ padding: "22px" }}>
+                  {buscando ? "Nenhum agendamento encontrado para esse telefone." : "Nenhum agendamento por aqui ainda."}
+                </div>
+              ) : listaExibida.map((a) => (
                 <div className="au-appt" key={a.id}>
                   <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
                   <div>
