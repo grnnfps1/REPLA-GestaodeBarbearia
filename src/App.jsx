@@ -113,6 +113,24 @@ function soDigitos(texto) {
   return (texto || "").replace(/\D/g, "");
 }
 
+// Formata como telefone brasileiro enquanto o cliente digita. Como o valor é
+// sempre reconstruído a partir dos dígitos, letras simplesmente não entram —
+// nem digitadas, nem coladas.
+function mascaraTelefone(valor) {
+  const d = soDigitos(valor).slice(0, 11); // DDD + 9 dígitos no máximo
+  if (d.length === 0) return "";
+  if (d.length <= 2) return `(${d}`;
+  if (d.length <= 6) return `(${d.slice(0, 2)}) ${d.slice(2)}`;
+  // 10 dígitos = fixo (4+4); 11 = celular (5+4).
+  if (d.length <= 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
+  return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
+}
+
+// DDD + 8 dígitos é o menor telefone válido no Brasil.
+function telefoneValido(valor) {
+  return soDigitos(valor).length >= 10;
+}
+
 // Meia-noite de hoje na barbearia, independente do fuso de quem abre a tela.
 function inicioDoDiaBR() {
   return `${chaveDiaBR(new Date().toISOString())}T00:00:00-03:00`;
@@ -401,6 +419,26 @@ const CSS = `
 .au-stat .n { font-family: 'Fraunces', serif; font-size: 34px; color: var(--gold-soft); line-height: 1; }
 .au-stat .l { color: var(--taupe); font-size: 12.5px; margin-top: 8px; }
 
+/* Tira de filtros por barbeiro. Rola na horizontal quando não couber,
+   para não quebrar o layout em tela estreita. */
+.au-chips {
+  display: flex; gap: 8px; overflow-x: auto;
+  padding-bottom: 4px; margin-bottom: 14px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.au-chips::-webkit-scrollbar { display: none; }
+.au-chip {
+  flex: 0 0 auto; cursor: pointer; font-family: inherit;
+  font-size: 13px; font-weight: 500; white-space: nowrap;
+  /* 42px de altura: confortável para o dedo no celular. */
+  padding: 11px 16px; min-height: 42px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--line-soft); color: var(--taupe);
+  transition: border-color .2s, color .2s;
+}
+.au-chip:hover { border-color: var(--gold); color: var(--cream); }
+.au-chip.on { background: var(--gold); border-color: var(--gold); color: #1a1410; font-weight: 600; }
+
 .au-search { position: relative; margin-bottom: 16px; }
 .au-search input {
   width: 100%; background: var(--surface); border: 1px solid var(--line-soft);
@@ -476,6 +514,8 @@ export default function App() {
   // Busca por telefone. O histórico completo (incluindo passados) só é baixado
   // na primeira vez que o dono busca algo — null = ainda não carregado.
   const [busca, setBusca] = useState("");
+  // "todos" ou o id de um barbeiro.
+  const [filtroBarbeiro, setFiltroBarbeiro] = useState("todos");
   const [historico, setHistorico] = useState(null);
   const [histLoading, setHistLoading] = useState(false);
   const [histError, setHistError] = useState(null);
@@ -615,6 +655,7 @@ export default function App() {
     setAppts([]);
     setHistorico(null);
     setBusca("");
+    setFiltroBarbeiro("todos");
     // Volta ao estado de "primeira carga" para o próximo login.
     setApptsLoading(true);
   }
@@ -717,17 +758,27 @@ export default function App() {
 
   // Números do topo do dashboard, todos derivados da agenda real.
   const hojeBR = chaveDiaBR(new Date().toISOString());
+
+  const doBarbeiroFiltrado = (lista) =>
+    filtroBarbeiro === "todos" ? lista : lista.filter((a) => a.barber_id === filtroBarbeiro);
+
+  // Os números do topo acompanham o barbeiro selecionado: com o filtro em
+  // "Rafael", "faturamento previsto" responde quanto o Rafael vai faturar.
+  const apptsDoFiltro = doBarbeiroFiltrado(appts);
   // Number() protege caso o preço venha como texto do banco.
-  const faturamentoPrevisto = appts.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
-  const aguardandoConfirmacao = appts.filter((a) => a.status !== "confirmado").length;
+  const faturamentoPrevisto = apptsDoFiltro.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
+  const aguardandoConfirmacao = apptsDoFiltro.filter((a) => a.status !== "confirmado").length;
 
   // Com busca ativa, a lista sai do histórico completo (passados inclusos).
   // Com o campo vazio, continua sendo só a agenda de hoje em diante.
+  // O filtro por barbeiro se aplica aos dois casos.
   const buscaDigitos = soDigitos(busca);
   const buscando = busca.trim() !== "";
-  const listaExibida = buscando
-    ? (historico ?? []).filter((a) => soDigitos(a.cliente_telefone).includes(buscaDigitos))
-    : appts;
+  const listaExibida = doBarbeiroFiltrado(
+    buscando
+      ? (historico ?? []).filter((a) => soDigitos(a.cliente_telefone).includes(buscaDigitos))
+      : appts
+  );
   const listaCarregando = buscando ? histLoading : apptsLoading;
 
   const startBooking = (barberId = null) => {
@@ -899,11 +950,20 @@ export default function App() {
               <div className="au-dash-date">{WEEKDAYS[new Date().getDay()].toUpperCase()}, {new Date().getDate()} {MONTHS[new Date().getMonth()].toUpperCase()}</div>
             </div>
             <div className="au-stats">
-              <div className="au-stat"><div className="n">{appts.length}</div><div className="l">Próximos agendamentos</div></div>
+              <div className="au-stat"><div className="n">{apptsDoFiltro.length}</div><div className="l">Próximos agendamentos</div></div>
               <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">Faturamento previsto</div></div>
               <div className="au-stat"><div className="n">{aguardandoConfirmacao}</div><div className="l">Aguardando confirmação</div></div>
               <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
+            <div className="au-chips">
+              <button className={`au-chip ${filtroBarbeiro === "todos" ? "on" : ""}`} onClick={() => setFiltroBarbeiro("todos")}>Todos</button>
+              {barbers.map((bb) => (
+                <button key={bb.id} className={`au-chip ${filtroBarbeiro === bb.id ? "on" : ""}`} onClick={() => setFiltroBarbeiro(bb.id)}>
+                  {bb.nome.split(" ")[0]}
+                </button>
+              ))}
+            </div>
+
             <div className="au-search">
               <input
                 type="text"
@@ -926,7 +986,11 @@ export default function App() {
                 <div className="au-note" style={{ padding: "22px" }}>{buscando ? "Buscando…" : "Carregando agenda…"}</div>
               ) : listaExibida.length === 0 ? (
                 <div className="au-note" style={{ padding: "22px" }}>
-                  {buscando ? "Nenhum agendamento encontrado para esse telefone." : "Nenhum agendamento por aqui ainda."}
+                  {buscando
+                    ? "Nenhum agendamento encontrado para esse telefone."
+                    : filtroBarbeiro !== "todos"
+                      ? "Nenhum agendamento para esse barbeiro."
+                      : "Nenhum agendamento por aqui ainda."}
                 </div>
               ) : listaExibida.map((a) => (
                 <div className="au-appt" key={a.id}>
@@ -1023,8 +1087,8 @@ export default function App() {
                     <div className="au-sumrow total"><span>Total</span><span>R$ {serviceObj?.preco}</span></div>
                   </div>
                   <div className="au-field"><label>Seu nome</label><input value={b.name} onChange={(e) => setBooking({ ...b, name: e.target.value })} placeholder="Como devemos te chamar?" /></div>
-                  <div className="au-field"><label>Telefone / WhatsApp</label><input value={b.phone} onChange={(e) => setBooking({ ...b, phone: e.target.value })} placeholder="(21) 90000-0000" /></div>
-                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 6 }} disabled={!b.name || !b.phone || saving} onClick={confirmBooking}>{saving ? "Confirmando…" : "Confirmar agendamento"}</button>
+                  <div className="au-field"><label>Telefone / WhatsApp</label><input type="tel" inputMode="numeric" autoComplete="tel" value={b.phone} onChange={(e) => setBooking({ ...b, phone: mascaraTelefone(e.target.value) })} placeholder="(21) 90000-0000" /></div>
+                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 6 }} disabled={!b.name.trim() || !telefoneValido(b.phone) || saving} onClick={confirmBooking}>{saving ? "Confirmando…" : "Confirmar agendamento"}</button>
                 </>
               )}
 
