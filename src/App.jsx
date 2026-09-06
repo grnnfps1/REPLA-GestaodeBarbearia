@@ -129,16 +129,71 @@ function nextDays(n) {
   return out;
 }
 
-function slotsFor() {
-  const taken = new Set(["09:30", "11:30", "15:30"]);
+/* ══════════════════════════════════════════════════════════════════════
+   CONFIGURAÇÃO DA BARBEARIA
+   Hoje vale para a barbearia única do MVP. Quando o sistema atender mais
+   de uma, isto sai daqui e vira configuração por barbearia no banco
+   (a tabela working_hours prevista no CLAUDE.md).
+   ══════════════════════════════════════════════════════════════════════ */
+
+// Jornada por dia da semana. O índice é o dia (0 = domingo ... 6 = sábado).
+// null = fechado.
+const HORARIO_FUNCIONAMENTO = [
+  null,                               // domingo — fechado
+  null,                               // segunda — fechado
+  { inicio: "09:00", fim: "19:00" },  // terça
+  { inicio: "09:00", fim: "19:00" },  // quarta
+  { inicio: "09:00", fim: "19:00" },  // quinta
+  { inicio: "09:00", fim: "19:00" },  // sexta
+  { inicio: "09:00", fim: "19:00" },  // sábado
+];
+
+// De quantos em quantos minutos os horários são oferecidos.
+const PASSO_MINUTOS = 30;
+
+function horaParaMinutos(hora) {
+  const [h, m] = hora.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function minutosParaHora(minutos) {
+  return `${String(Math.floor(minutos / 60)).padStart(2, "0")}:${String(minutos % 60).padStart(2, "0")}`;
+}
+
+// Todos os horários que a barbearia oferece nesse dia, sem considerar
+// ocupação. O último cabe inteiro antes do fechamento: fim 19:00 com passo
+// de 30 min gera até 18:30.
+function horariosDoDia(date) {
+  const jornada = HORARIO_FUNCIONAMENTO[date.getDay()];
+  if (!jornada) return [];
+
   const out = [];
-  for (let h = 9; h < 19; h++) {
-    for (const m of [0, 30]) {
-      const t = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-      out.push({ t, free: !taken.has(t) });
-    }
+  const fim = horaParaMinutos(jornada.fim);
+  for (let m = horaParaMinutos(jornada.inicio); m < fim; m += PASSO_MINUTOS) {
+    out.push(minutosParaHora(m));
   }
   return out;
+}
+
+function estaFechado(date) {
+  return HORARIO_FUNCIONAMENTO[date.getDay()] === null;
+}
+
+function proximoDia(date) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + 1);
+  return d;
+}
+
+// Minutos desde a meia-noite, agora, no horário da barbearia.
+function minutosAgoraBR() {
+  const b = paraBrasilia(new Date().toISOString());
+  return b.getUTCHours() * 60 + b.getUTCMinutes();
+}
+
+// Chave YYYY-MM-DD de uma data do calendário (a que o cliente vê e toca).
+function chaveDiaLocal(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
 const CSS = `
@@ -306,6 +361,9 @@ const CSS = `
 .au-date .d2 { font-family: 'Fraunces', serif; font-size: 22px; margin-top: 2px; }
 .au-date .d3 { font-size: 10.5px; opacity: .7; }
 
+/* Altura reservada de ~3 linhas: impede o botão Continuar de pular para
+   cima enquanto os horários carregam. */
+.au-slots-area { min-height: 138px; }
 .au-slots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; }
 .au-slot { padding: 11px 0; text-align: center; font-size: 13.5px; cursor: pointer; color: var(--cream); font-family: inherit;
   background: var(--surface); border: 1px solid var(--line-soft); border-radius: 10px; transition: border-color .2s; }
@@ -593,7 +651,69 @@ export default function App() {
   useScrollLock(booking !== null);
 
   const days = useMemo(() => nextDays(14), []);
-  const slots = useMemo(() => slotsFor(), []);
+
+  // Horários realmente livres do barbeiro escolhido, na data escolhida.
+  const [slotsLivres, setSlotsLivres] = useState([]);
+  const [slotsLoading, setSlotsLoading] = useState(false);
+  const [slotsError, setSlotsError] = useState(null);
+
+  // Valores primitivos como dependência: o objeto booking muda a cada tecla
+  // digitada no formulário, e isso refaria a consulta sem necessidade.
+  const barbeiroEscolhido = booking?.barber ?? null;
+  const dataEscolhida = booking?.date ?? null;
+
+  useEffect(() => {
+    if (!barbeiroEscolhido || dataEscolhida === null) return;
+
+    let cancelled = false;
+
+    void (async () => {
+      setSlotsLoading(true);
+      setSlotsError(null);
+
+      const dia = days[dataEscolhida];
+      const possiveis = horariosDoDia(dia);
+
+      // Dia fechado: nem consulta o banco.
+      if (possiveis.length === 0) {
+        if (!cancelled) {
+          setSlotsLivres([]);
+          setSlotsLoading(false);
+        }
+        return;
+      }
+
+      // Janela do dia inteiro, no mesmo fuso usado na gravação.
+      const { data, error } = await supabase
+        .from("appointments")
+        .select("data_hora")
+        .eq("barber_id", barbeiroEscolhido)
+        .gte("data_hora", toTimestampBR(dia, "00:00"))
+        .lt("data_hora", toTimestampBR(proximoDia(dia), "00:00"));
+
+      if (cancelled) return;
+
+      if (error) {
+        setSlotsError(error.message);
+        setSlotsLivres([]);
+        setSlotsLoading(false);
+        return;
+      }
+
+      const ocupados = new Set(data.map((r) => formatHoraBR(r.data_hora)));
+      const ehHoje = chaveDiaLocal(dia) === chaveDiaBR(new Date().toISOString());
+      const agora = minutosAgoraBR();
+
+      setSlotsLivres(
+        possiveis.filter(
+          (t) => !ocupados.has(t) && (!ehHoje || horaParaMinutos(t) > agora)
+        )
+      );
+      setSlotsLoading(false);
+    })();
+
+    return () => { cancelled = true; };
+  }, [barbeiroEscolhido, dataEscolhida, days]);
 
   // Números do topo do dashboard, todos derivados da agenda real.
   const hojeBR = chaveDiaBR(new Date().toISOString());
@@ -658,6 +778,10 @@ export default function App() {
   const serviceObj = b?.service ? services.find((x) => x.id === b.service) : null;
   // Quem faz o quê virá da tabela barber_services num próximo passo.
   const availServices = services;
+
+  // Só libera o "Continuar" se o horário escolhido ainda estiver na lista.
+  // Protege o caso de trocar de barbeiro depois de já ter escolhido a hora.
+  const horarioSelecionadoValido = Boolean(b?.time && slotsLivres.includes(b.time));
 
   const steps = ["Profissional", "Serviço", "Data e horário", "Seus dados", "Pronto"];
 
@@ -839,7 +963,7 @@ export default function App() {
               {bookingError && <div className="au-alert">{bookingError}</div>}
 
               {b.step === 0 && barbers.map((bb) => (
-                <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, service: null, step: 1 })}>
+                <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, service: null, time: null, step: 1 })}>
                   <img src={bb.foto_url} alt="" />
                   <div className="au-pick-main">
                     <div className="au-pick-t">{bb.nome}</div>
@@ -869,12 +993,24 @@ export default function App() {
                       </button>
                     ))}
                   </div>
-                  <div className="au-slots">
-                    {slots.map((s) => (
-                      <button key={s.t} className={`au-slot ${b.time === s.t ? "sel" : ""}`} disabled={!s.free} onClick={() => { setBookingError(null); setBooking({ ...b, time: s.t }); }}>{s.t}</button>
-                    ))}
+                  <div className="au-slots-area">
+                    {slotsLoading ? (
+                      <div className="au-note">Carregando horários…</div>
+                    ) : slotsError ? (
+                      <div className="au-note err">Não foi possível ver os horários agora. Tente de novo em instantes.</div>
+                    ) : estaFechado(days[b.date]) ? (
+                      <div className="au-note">A barbearia não abre neste dia.</div>
+                    ) : slotsLivres.length === 0 ? (
+                      <div className="au-note">Nenhum horário disponível neste dia. Tente outra data.</div>
+                    ) : (
+                      <div className="au-slots">
+                        {slotsLivres.map((t) => (
+                          <button key={t} className={`au-slot ${b.time === t ? "sel" : ""}`} onClick={() => { setBookingError(null); setBooking({ ...b, time: t }); }}>{t}</button>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 22 }} disabled={!b.time} onClick={() => setBooking({ ...b, step: 3 })}>Continuar</button>
+                  <button className="au-btn" style={{ width: "100%", justifyContent: "center", marginTop: 22 }} disabled={!horarioSelecionadoValido} onClick={() => setBooking({ ...b, step: 3 })}>Continuar</button>
                 </>
               )}
 
