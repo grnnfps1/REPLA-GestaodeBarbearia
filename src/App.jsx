@@ -131,6 +131,14 @@ function telefoneValido(valor) {
   return soDigitos(valor).length >= 10;
 }
 
+// Soma um dia a uma chave YYYY-MM-DD. Usa Date.UTC só para normalizar a
+// virada de mês e de ano; é função pura da chave recebida.
+function chaveDiaSeguinte(chave) {
+  const [ano, mes, dia] = chave.split("-").map(Number);
+  const d = new Date(Date.UTC(ano, mes - 1, dia + 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
 // Meia-noite de hoje na barbearia, independente do fuso de quem abre a tela.
 function inicioDoDiaBR() {
   return `${chaveDiaBR(new Date().toISOString())}T00:00:00-03:00`;
@@ -275,7 +283,6 @@ const CSS = `
 .au-hero h1 { font-family: 'Fraunces', serif; font-weight: 600; font-size: clamp(48px, 12vw, 104px); line-height: 0.92; color: var(--cream); }
 .au-hero h1 em { font-style: italic; color: var(--gold-soft); }
 .au-hero-tag { margin: 26px auto 0; max-width: 440px; color: var(--taupe); font-size: 16px; line-height: 1.6; }
-.au-rule { width: 1px; height: 46px; background: var(--gold); margin: 40px auto 0; opacity: .6; }
 
 .au-btn {
   display: inline-flex; align-items: center; gap: 9px; cursor: pointer;
@@ -439,6 +446,16 @@ const CSS = `
 .au-chip:hover { border-color: var(--gold); color: var(--cream); }
 .au-chip.on { background: var(--gold); border-color: var(--gold); color: #1a1410; font-weight: 600; }
 
+/* Seletor de data nativo, vestido de pastilha. 16px evita o zoom
+   automático do iOS ao focar o campo. */
+.au-chip-date {
+  flex: 0 0 auto; cursor: pointer; font-family: inherit; font-size: 16px;
+  padding: 9px 14px; min-height: 42px; border-radius: 999px;
+  background: var(--surface); border: 1px solid var(--line-soft); color: var(--taupe);
+}
+.au-chip-date.on { border-color: var(--gold); color: var(--gold-soft); }
+.au-chip-date::-webkit-calendar-picker-indicator { filter: invert(0.7) sepia(1) saturate(3) hue-rotate(5deg); cursor: pointer; }
+
 .au-search { position: relative; margin-bottom: 16px; }
 .au-search input {
   width: 100%; background: var(--surface); border: 1px solid var(--line-soft);
@@ -516,6 +533,20 @@ export default function App() {
   const [busca, setBusca] = useState("");
   // "todos" ou o id de um barbeiro.
   const [filtroBarbeiro, setFiltroBarbeiro] = useState("todos");
+  // "proximos" (hoje em diante) ou uma data YYYY-MM-DD.
+  const [filtroData, setFiltroData] = useState("proximos");
+
+  // Derivações dos filtros. Ficam aqui em cima porque os efeitos abaixo
+  // dependem delas.
+  const hojeBR = chaveDiaBR(new Date().toISOString());
+  const amanhaBR = chaveDiaSeguinte(hojeBR);
+  const buscaDigitos = soDigitos(busca);
+  const buscando = busca.trim() !== "";
+  const filtroDataAtiva = filtroData !== "proximos";
+  // `appts` só tem de hoje em diante. Para um dia passado a fonte precisa ser
+  // o histórico completo — o mesmo que a busca por telefone já usa.
+  const filtroDataPassada = filtroDataAtiva && filtroData < hojeBR;
+  const precisaHistorico = buscando || filtroDataPassada;
   const [historico, setHistorico] = useState(null);
   const [histLoading, setHistLoading] = useState(false);
   const [histError, setHistError] = useState(null);
@@ -597,10 +628,11 @@ export default function App() {
     };
   }, [userId, loadAppts]);
 
-  // Baixa o histórico completo uma única vez, na primeira busca da sessão.
-  // Enquanto o campo estiver vazio, nada disso roda.
+  // Baixa o histórico completo uma única vez por sessão, quando algo precisa
+  // enxergar o passado: uma busca por telefone ou um filtro de data anterior
+  // a hoje. Sem isso, nada disso roda.
   useEffect(() => {
-    if (!userId || !busca.trim() || historico !== null) return;
+    if (!userId || !precisaHistorico || historico !== null) return;
 
     let cancelled = false;
 
@@ -623,7 +655,7 @@ export default function App() {
 
     loadHistorico();
     return () => { cancelled = true; };
-  }, [userId, busca, historico]);
+  }, [userId, precisaHistorico, historico]);
 
   async function handleLogin() {
     if (signingIn) return;
@@ -656,6 +688,7 @@ export default function App() {
     setHistorico(null);
     setBusca("");
     setFiltroBarbeiro("todos");
+    setFiltroData("proximos");
     // Volta ao estado de "primeira carga" para o próximo login.
     setApptsLoading(true);
   }
@@ -757,29 +790,30 @@ export default function App() {
   }, [barbeiroEscolhido, dataEscolhida, days]);
 
   // Números do topo do dashboard, todos derivados da agenda real.
-  const hojeBR = chaveDiaBR(new Date().toISOString());
-
-  const doBarbeiroFiltrado = (lista) =>
+  const doBarbeiro = (lista) =>
     filtroBarbeiro === "todos" ? lista : lista.filter((a) => a.barber_id === filtroBarbeiro);
+  const doDia = (lista) =>
+    !filtroDataAtiva ? lista : lista.filter((a) => chaveDiaBR(a.data_hora) === filtroData);
 
-  // Os números do topo acompanham o barbeiro selecionado: com o filtro em
-  // "Rafael", "faturamento previsto" responde quanto o Rafael vai faturar.
-  const apptsDoFiltro = doBarbeiroFiltrado(appts);
+  // Os números do topo acompanham barbeiro e data selecionados, para não
+  // contradizerem a lista logo abaixo. A busca por telefone não entra: ela é
+  // uma consulta pontual, não uma visão da agenda.
+  const apptsDoFiltro = doBarbeiro(doDia(filtroDataPassada ? (historico ?? []) : appts));
   // Number() protege caso o preço venha como texto do banco.
   const faturamentoPrevisto = apptsDoFiltro.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
   const aguardandoConfirmacao = apptsDoFiltro.filter((a) => a.status !== "confirmado").length;
 
-  // Com busca ativa, a lista sai do histórico completo (passados inclusos).
-  // Com o campo vazio, continua sendo só a agenda de hoje em diante.
-  // O filtro por barbeiro se aplica aos dois casos.
-  const buscaDigitos = soDigitos(busca);
-  const buscando = busca.trim() !== "";
-  const listaExibida = doBarbeiroFiltrado(
-    buscando
-      ? (historico ?? []).filter((a) => soDigitos(a.cliente_telefone).includes(buscaDigitos))
-      : appts
+  // A lista aplica os três filtros em sequência: telefone, data e barbeiro.
+  const listaExibida = doBarbeiro(
+    doDia(
+      buscando
+        ? (historico ?? []).filter((a) => soDigitos(a.cliente_telefone).includes(buscaDigitos))
+        : precisaHistorico
+          ? (historico ?? [])
+          : appts
+    )
   );
-  const listaCarregando = buscando ? histLoading : apptsLoading;
+  const listaCarregando = precisaHistorico ? histLoading : apptsLoading;
 
   const startBooking = (barberId = null) => {
     setBookingError(null);
@@ -857,8 +891,7 @@ export default function App() {
             <div className="au-hero-est">EST. 2019 · RIO DE JANEIRO</div>
             <h1 className="au-serif">Áurea<br /><em>Barbearia</em></h1>
             <p className="au-hero-tag">Corte, barba e navalha com hora marcada. Reserve com o profissional certo em menos de um minuto.</p>
-            <div className="au-rule" />
-            <div style={{ marginTop: 34 }}>
+            <div style={{ marginTop: 44 }}>
               <button className="au-btn" onClick={() => startBooking()}>Agendar horário</button>
             </div>
           </header>
@@ -950,8 +983,8 @@ export default function App() {
               <div className="au-dash-date">{WEEKDAYS[new Date().getDay()].toUpperCase()}, {new Date().getDate()} {MONTHS[new Date().getMonth()].toUpperCase()}</div>
             </div>
             <div className="au-stats">
-              <div className="au-stat"><div className="n">{apptsDoFiltro.length}</div><div className="l">Próximos agendamentos</div></div>
-              <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">Faturamento previsto</div></div>
+              <div className="au-stat"><div className="n">{apptsDoFiltro.length}</div><div className="l">{filtroDataAtiva ? "Agendamentos no dia" : "Próximos agendamentos"}</div></div>
+              <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">{filtroDataPassada ? "Faturamento do dia" : "Faturamento previsto"}</div></div>
               <div className="au-stat"><div className="n">{aguardandoConfirmacao}</div><div className="l">Aguardando confirmação</div></div>
               <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
@@ -962,6 +995,19 @@ export default function App() {
                   {bb.nome.split(" ")[0]}
                 </button>
               ))}
+            </div>
+
+            <div className="au-chips">
+              <button className={`au-chip ${!filtroDataAtiva ? "on" : ""}`} onClick={() => setFiltroData("proximos")}>Próximos</button>
+              <button className={`au-chip ${filtroData === hojeBR ? "on" : ""}`} onClick={() => setFiltroData(hojeBR)}>Hoje</button>
+              <button className={`au-chip ${filtroData === amanhaBR ? "on" : ""}`} onClick={() => setFiltroData(amanhaBR)}>Amanhã</button>
+              <input
+                type="date"
+                className={`au-chip-date ${filtroDataAtiva ? "on" : ""}`}
+                aria-label="Filtrar por uma data específica"
+                value={filtroDataAtiva ? filtroData : ""}
+                onChange={(e) => setFiltroData(e.target.value || "proximos")}
+              />
             </div>
 
             <div className="au-search">
@@ -988,8 +1034,8 @@ export default function App() {
                 <div className="au-note" style={{ padding: "22px" }}>
                   {buscando
                     ? "Nenhum agendamento encontrado para esse telefone."
-                    : filtroBarbeiro !== "todos"
-                      ? "Nenhum agendamento para esse barbeiro."
+                    : filtroDataAtiva || filtroBarbeiro !== "todos"
+                      ? "Nenhum agendamento para esses filtros."
                       : "Nenhum agendamento por aqui ainda."}
                 </div>
               ) : listaExibida.map((a) => (
