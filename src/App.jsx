@@ -56,9 +56,6 @@ function mapBarber(row) {
   };
 }
 
-// Um UUID v4 novo, sorteado aqui no navegador. crypto.randomUUID existe em
-// todo navegador atual, mas só em conexão segura (https ou localhost) — o
-// plano B cobre o resto.
 // Soma em reais. Só mostra centavos quando existem: "R$ 90", não "R$ 90,00"
 // — e nunca "R$ 90,5", que é o que o toLocaleString cru devolveria.
 function precoBR(valor) {
@@ -87,14 +84,27 @@ function totalDoAppt(appt) {
   return (appt.services ?? []).reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
 }
 
-function novoId() {
-  if (crypto.randomUUID) return crypto.randomUUID();
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40; // versão 4
-  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variante RFC 4122
-  const h = [...bytes].map((x) => x.toString(16).padStart(2, "0"));
-  return [h.slice(0, 4), h.slice(4, 6), h.slice(6, 8), h.slice(8, 10), h.slice(10, 16)]
-    .map((parte) => parte.join("")).join("-");
+// Os dois jeitos de o banco dizer "esse horário já é de outra pessoa":
+//
+//   23P01  exclusion_violation — a trava de sobreposição, que compara
+//          intervalos. É o caso normal desde a Parte 3.1.
+//   23505  unique_violation — a constraint antiga (barber_id, data_hora),
+//          que só olhava o instante de início. Mantido porque ela pode
+//          ainda existir no banco, e porque a chave de appointment_services
+//          usa o mesmo código.
+const CODIGOS_HORARIO_OCUPADO = ["23P01", "23505"];
+
+// Vindo de supabase.rpc, o código do Postgres chega direto em error.code —
+// não vem aninhado. Ainda assim varremos message e details: é mais barato
+// do que mostrar "erro inesperado" justamente na falha mais comum daqui.
+function horarioJaOcupado(error) {
+  if (!error) return false;
+  if (CODIGOS_HORARIO_OCUPADO.includes(error.code)) return true;
+
+  const texto = [error.code, error.message, error.details, error.hint]
+    .filter(Boolean).join(" ");
+  return CODIGOS_HORARIO_OCUPADO.some((c) => texto.includes(c))
+    || texto.includes("appointments_sem_sobreposicao");
 }
 
 function mapService(row) {
@@ -297,14 +307,16 @@ function horariosDoDia(date) {
   return out;
 }
 
-function estaFechado(date) {
-  return HORARIO_FUNCIONAMENTO[date.getDay()] === null;
+// Minuto em que a barbearia fecha nesse dia (null se estiver fechada). O
+// calculo de horarios precisa disso para saber se o combo cabe INTEIRO antes
+// do fechamento — horariosDoDia sozinho so garante que o INICIO cabe.
+function fechamentoDoDia(date) {
+  const jornada = HORARIO_FUNCIONAMENTO[date.getDay()];
+  return jornada ? horaParaMinutos(jornada.fim) : null;
 }
 
-function proximoDia(date) {
-  const d = new Date(date);
-  d.setDate(d.getDate() + 1);
-  return d;
+function estaFechado(date) {
+  return HORARIO_FUNCIONAMENTO[date.getDay()] === null;
 }
 
 // Minutos desde a meia-noite, agora, no horário da barbearia.
@@ -1079,6 +1091,28 @@ export default function App() {
 
   const days = useMemo(() => nextDays(14), []);
 
+  // ── Serviços escolhidos e totais ──────────────────────────────────
+  // Moram aqui em cima, e não junto do resto da tela, porque a duração do
+  // combo é dependência do efeito logo abaixo. Declarados depois, a lista
+  // de dependências leria uma const ainda não inicializada e quebraria.
+
+  // Quem faz o quê virá da tabela barber_services num próximo passo.
+  const availServices = services;
+
+  // Os marcados, na ordem do cardápio e não na ordem dos cliques — assim o
+  // resumo não embaralha a cada toque. Sai do availServices, então serviço
+  // que o barbeiro não faz nunca entra na conta.
+  const servicosEscolhidos = availServices.filter((s) => booking?.services?.includes(s.id));
+  const totalPreco = servicosEscolhidos.reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
+  const totalDuracao = servicosEscolhidos.reduce((soma, s) => soma + Number(s.duracao_min ?? 0), 0);
+  const resumoServicos = servicosEscolhidos.map((s) => s.nome.toLowerCase()).join(" + ");
+
+  // Quanto tempo o horário precisa reservar. Enquanto nada está marcado (o
+  // cliente ainda está no passo anterior), vale o passo da grade — é o mínimo
+  // que qualquer atendimento ocupa. Ao marcar um serviço, o efeito abaixo
+  // recalcula com a duração real.
+  const duracaoCombo = totalDuracao > 0 ? totalDuracao : PASSO_MINUTOS;
+
   // Horários realmente livres do barbeiro escolhido, na data escolhida.
   const [slotsLivres, setSlotsLivres] = useState([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
@@ -1110,13 +1144,22 @@ export default function App() {
         return;
       }
 
-      // Janela do dia inteiro, no mesmo fuso usado na gravação.
-      const { data, error } = await supabase
-        .from("appointments")
-        .select("data_hora")
-        .eq("barber_id", barbeiroEscolhido)
-        .gte("data_hora", toTimestampBR(dia, "00:00"))
-        .lt("data_hora", toTimestampBR(proximoDia(dia), "00:00"));
+      // Os intervalos ocupados vêm de uma FUNÇÃO do banco, não da tabela.
+      //
+      // O RLS de appointments só libera leitura para quem está logado — e
+      // quem agenda não está. Lendo a tabela direto, o visitante recebia uma
+      // lista vazia sem erro nenhum, e o app oferecia até os horários já
+      // tomados. A função horarios_ocupados devolve apenas (inicio, minutos):
+      // o visitante fica sabendo que a cadeira está ocupada, nunca de quem.
+      //
+      // p_dia usa chaveDiaLocal, que monta o AAAA-MM-DD com os mesmos
+      // componentes de data que o toTimestampBR usa para gravar. A função
+      // recorta o dia com o mesmo -03:00 fixo, então os dois lados concordam
+      // sobre onde o dia começa e termina.
+      const { data, error } = await supabase.rpc("horarios_ocupados", {
+        p_barber_id: barbeiroEscolhido,
+        p_dia: chaveDiaLocal(dia),
+      });
 
       if (cancelled) return;
 
@@ -1127,20 +1170,49 @@ export default function App() {
         return;
       }
 
-      const ocupados = new Set(data.map((r) => formatHoraBR(r.data_hora)));
+      // Tudo vira minuto desde a meia-noite: comparar números é mais simples
+      // e mais seguro do que comparar textos de hora ou objetos Date.
+      //
+      // Cancelado não vem: a função já filtra no banco, com a mesma condição
+      // que a trava appointments_sem_sobreposicao usa. A regra passa a viver
+      // num lugar só, em vez de repetida aqui e lá — repetida, uma das duas
+      // acabaria mudando sozinha um dia.
+      const ocupados = (data ?? []).map((r) => {
+        const inicio = horaParaMinutos(formatHoraBR(r.inicio));
+        return { inicio, fim: inicio + Number(r.minutos ?? PASSO_MINUTOS) };
+      });
+
+      const fechamento = fechamentoDoDia(dia);
       const ehHoje = chaveDiaLocal(dia) === chaveDiaBR(new Date().toISOString());
       const agora = minutosAgoraBR();
 
       setSlotsLivres(
-        possiveis.filter(
-          (t) => !ocupados.has(t) && (!ehHoje || horaParaMinutos(t) > agora)
-        )
+        possiveis.filter((t) => {
+          const inicio = horaParaMinutos(t);
+          const fim = inicio + duracaoCombo;
+
+          // 1. O combo inteiro tem que caber antes de fechar. horariosDoDia
+          //    só garante que o INÍCIO cabe: 18:30 é oferecido mesmo quando o
+          //    combo dura 70 min e a barbearia fecha às 19:00.
+          if (fim > fechamento) return false;
+
+          // 2. No dia de hoje, horário que já passou não vale.
+          if (ehHoje && inicio <= agora) return false;
+
+          // 3. Nenhuma sobreposição com o que já está marcado. Dois
+          //    intervalos [a,b) e [c,d) se cruzam quando a < d E c < b.
+          //    Repare que é "<" e não "<=": encostar não é cruzar, então um
+          //    corte que termina 10:30 deixa o horário das 10:30 livre.
+          return !ocupados.some((o) => inicio < o.fim && o.inicio < fim);
+        })
       );
       setSlotsLoading(false);
     })();
 
     return () => { cancelled = true; };
-  }, [barbeiroEscolhido, dataEscolhida, days]);
+    // duracaoCombo entra aqui: marcar ou desmarcar um serviço muda a duração
+    // e, com ela, quais horários ainda cabem.
+  }, [barbeiroEscolhido, dataEscolhida, days, duracaoCombo]);
 
   // Números do topo do dashboard, todos derivados da agenda real.
   const doBarbeiro = (lista) =>
@@ -1180,38 +1252,35 @@ export default function App() {
 
   const b = booking;
 
-  // Grava o agendamento no banco. A tela de sucesso só aparece se der certo.
+  // Grava o agendamento. A tela de sucesso só aparece se der certo.
   //
-  // São DUAS escritas: a linha em appointments e uma linha por serviço em
-  // appointment_services. O id sai do navegador (novoId) de propósito: o
-  // cliente agenda sem login e não tem permissão de LER appointments, então
-  // não daria para perguntar ao banco qual id ele acabou de criar.
+  // UMA chamada só: a função criar_agendamento insere em appointments E em
+  // appointment_services dentro da mesma transação do banco. Ou grava tudo,
+  // ou não grava nada — o que encerra a dívida da Parte 2, quando as duas
+  // escritas eram separadas e podiam deixar o agendamento pela metade sem
+  // jeito de desfazer.
+  //
+  // A duração NÃO vai daqui: o servidor soma services.duracao_min dos ids
+  // recebidos. O navegador é a parte do sistema que qualquer pessoa
+  // consegue editar, então ele não pode ser a fonte da verdade de um
+  // número que alimenta a trava de sobreposição.
   async function confirmBooking() {
     if (saving) return;
     setSaving(true);
     setBookingError(null);
 
-    const idAgendamento = novoId();
-    const idsServicos = servicosEscolhidos.map((s) => s.id);
-
-    const { error } = await supabase.from("appointments").insert({
-      id: idAgendamento,
-      barber_id: b.barber,
-      // Coluna antiga, ainda obrigatória: recebe o PRIMEIRO serviço da lista
-      // só para não quebrar. Quem manda agora é appointment_services; ela sai
-      // numa próxima parte.
-      service_id: idsServicos[0],
-      data_hora: toTimestampBR(days[b.date], b.time),
-      cliente_nome: b.name.trim(),
-      cliente_telefone: b.phone.trim(),
-      status: "confirmado",
+    const { error } = await supabase.rpc("criar_agendamento", {
+      p_barber_id: b.barber,
+      p_data_hora: toTimestampBR(days[b.date], b.time),
+      p_cliente_nome: b.name.trim(),
+      p_cliente_telefone: b.phone.trim(),
+      p_service_ids: servicosEscolhidos.map((s) => s.id),
     });
 
+    setSaving(false);
+
     if (error) {
-      setSaving(false);
-      // 23505 = violação de UNIQUE no Postgres. Aqui só pode ser a constraint
-      // (barber_id, data_hora): alguém pegou esse horário primeiro.
-      if (error.code === "23505") {
+      if (horarioJaOcupado(error)) {
         setBookingError("Ops, esse horário acabou de ser reservado. Escolha outro, por favor.");
         setBooking({ ...b, step: 2, time: null });
       } else {
@@ -1220,43 +1289,9 @@ export default function App() {
       return;
     }
 
-    const { error: erroServicos } = await supabase
-      .from("appointment_services")
-      .insert(idsServicos.map((sid) => ({ appointment_id: idAgendamento, service_id: sid })));
-
-    if (erroServicos) {
-      // Segunda escrita falhou. Tenta desfazer a primeira para não deixar o
-      // agendamento pela metade. Só tratamos como desfeito se o banco
-      // confirmar 1 linha apagada — no escuro, avisamos a mais.
-      const { error: erroDesfazer, count } = await supabase
-        .from("appointments")
-        .delete({ count: "exact" })
-        .eq("id", idAgendamento);
-
-      setSaving(false);
-      setBookingError(
-        !erroDesfazer && count === 1
-          ? "Não conseguimos concluir seu agendamento agora. Tente de novo em alguns instantes."
-          : "Seu horário ficou reservado, mas só registramos o primeiro serviço. Chame a gente no WhatsApp para incluir os demais."
-      );
-      return;
-    }
-
-    setSaving(false);
     setBooking({ ...b, step: 4 });
   }
   const barberObj = b?.barber ? barbers.find((x) => x.id === b.barber) : null;
-  // Quem faz o quê virá da tabela barber_services num próximo passo.
-  const availServices = services;
-
-  // Os marcados, na ordem do cardápio e não na ordem dos cliques — assim o
-  // resumo não embaralha a cada toque. Sai do availServices, então serviço
-  // que o barbeiro não faz nunca entra na conta.
-  const servicosEscolhidos = availServices.filter((s) => b?.services?.includes(s.id));
-  const totalPreco = servicosEscolhidos.reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
-  const totalDuracao = servicosEscolhidos.reduce((soma, s) => soma + Number(s.duracao_min ?? 0), 0);
-  const resumoServicos = servicosEscolhidos.map((s) => s.nome.toLowerCase()).join(" + ");
-
   // Marca/desmarca um serviço. Nenhum horário é recalculado aqui: a duração
   // só passa a mexer nos horários oferecidos na Parte 3.
   const toggleService = (id) => {
