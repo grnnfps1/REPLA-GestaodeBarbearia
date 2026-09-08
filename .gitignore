@@ -10,6 +10,8 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+# Service worker de desenvolvimento, gerado pelo vite-plugin-pwa
+dev-dist
 *.local
 
 # Variáveis de ambiente (credenciais) — nunca versionar
