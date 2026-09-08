@@ -1,5 +1,7 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { supabase } from "./supabaseClient";
+import { useInstalacaoPWA } from "./useInstalacaoPWA";
+import { FaixaInstalar } from "./InstalarApp";
 
 // Trava o scroll da página de fundo enquanto um overlay está aberto.
 // `overflow: hidden` no body sozinho NÃO segura o iOS Safari — lá é preciso
@@ -248,7 +250,10 @@ const CSS = `
 .au-top {
   position: sticky; top: 0; z-index: 40;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 24px;
+  /* Safe areas do iOS: afastam o conteúdo da câmera/ilha quando o app roda
+     instalado em tela cheia. Onde não há entalhe, env() vale 0 e o padding
+     fica exatamente o de antes. */
+  padding: calc(14px + env(safe-area-inset-top)) calc(24px + env(safe-area-inset-right)) 14px calc(24px + env(safe-area-inset-left));
   background: rgba(15,12,10,0.82);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line-soft);
@@ -342,10 +347,46 @@ const CSS = `
 .au-sprice { font-family: 'Fraunces', serif; font-size: 24px; color: var(--gold-soft); }
 .au-smin { color: var(--taupe); font-size: 12px; margin-top: 2px; }
 
-.au-foot { border-top: 1px solid var(--line-soft); padding: 46px 24px; text-align: center; color: var(--taupe); font-size: 13px; }
+.au-foot {
+  border-top: 1px solid var(--line-soft); text-align: center; color: var(--taupe); font-size: 13px;
+  /* A base ganha o espaço da barrinha de gestos do iPhone. */
+  padding: 46px calc(24px + env(safe-area-inset-right)) calc(46px + env(safe-area-inset-bottom)) calc(24px + env(safe-area-inset-left));
+}
 .au-foot .au-mark { justify-content: center; margin-bottom: 16px; }
 
-.au-ov { position: fixed; inset: 0; z-index: 60; background: rgba(9,7,5,0.72); backdrop-filter: blur(6px); display: flex; align-items: flex-end; justify-content: center; }
+/* padding-top impede a folha de encostar na câmera quando o conteúdo é alto. */
+/* ── Faixa de instalação do PWA ────────────────────────────────────── */
+.au-install {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+  display: flex; align-items: center; gap: 11px;
+  background: rgba(15,12,10,0.96);
+  backdrop-filter: blur(12px);
+  border-top: 1px solid var(--line);
+  padding: 10px calc(12px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+}
+.au-install-mark {
+  flex: 0 0 auto; width: 30px; height: 30px; border-radius: 50%;
+  border: 1.5px solid var(--gold); display: grid; place-items: center;
+  color: var(--gold); font-family: 'Fraunces', serif; font-weight: 600; font-size: 14px;
+}
+/* min-width: 0 é o que permite o texto quebrar em vez de estourar o flex. */
+.au-install-txt { flex: 1 1 auto; min-width: 0; }
+.au-install-t { font-size: 13px; font-weight: 600; color: var(--cream); line-height: 1.3; }
+.au-install-s { font-size: 11.5px; color: var(--taupe); line-height: 1.45; margin-top: 3px; }
+.au-install-btn { flex: 0 0 auto; padding: 11px 18px; font-size: 13px; }
+.au-install-x {
+  flex: 0 0 auto; width: 38px; height: 38px; border-radius: 50%;
+  background: transparent; border: 1px solid var(--line-soft); color: var(--cream);
+  cursor: pointer; font-size: 14px; display: grid; place-items: center; font-family: inherit;
+}
+.au-install-x:hover { border-color: var(--gold); }
+/* Em tela bem estreita o monograma sai para o texto respirar. */
+@media (max-width: 380px) {
+  .au-install-mark { display: none; }
+  .au-install-btn { padding: 11px 14px; }
+}
+
+.au-ov { position: fixed; inset: 0; z-index: 60; background: rgba(9,7,5,0.72); backdrop-filter: blur(6px); display: flex; align-items: flex-end; justify-content: center; padding-top: env(safe-area-inset-top); }
 @media (min-width: 720px){ .au-ov { align-items: center; } }
 .au-sheet {
   background: var(--espresso); border: 1px solid var(--line); border-radius: 22px 22px 0 0;
@@ -360,7 +401,9 @@ const CSS = `
 .au-sheet-head h3 { font-family: 'Fraunces', serif; font-size: 22px; color: var(--cream); margin-top: 4px; }
 .au-x { background: transparent; border: 1px solid var(--line-soft); color: var(--cream); width: 34px; height: 34px; border-radius: 50%; cursor: pointer; font-size: 16px; }
 .au-x:hover { border-color: var(--gold); }
-.au-sheet-body { padding: 22px 24px 28px; }
+/* A folha é colada na base no celular: o último botão precisa ficar acima da
+   barrinha de gestos. */
+.au-sheet-body { padding: 22px 24px calc(28px + env(safe-area-inset-bottom)); }
 
 .au-alert {
   background: rgba(201,163,91,0.08); border: 1px solid var(--line); border-radius: 12px;
@@ -724,6 +767,13 @@ export default function App() {
   // digitada no formulário e a página pularia.
   useScrollLock(booking !== null);
 
+  // A faixa sai de cena durante o agendamento: ela é fixa na base e cobriria
+  // os botões da folha no celular.
+  const instalacao = useInstalacaoPWA();
+  // Quando visível, o .au-root ganha um padding de 74px na base para a faixa
+  // não cobrir o rodapé nem o botão "Sair" da gestão.
+  const mostrarFaixa = instalacao.visivel && booking === null;
+
   const days = useMemo(() => nextDays(14), []);
 
   // Horários realmente livres do barbeiro escolhido, na data escolhida.
@@ -871,7 +921,7 @@ export default function App() {
   const steps = ["Profissional", "Serviço", "Data e horário", "Seus dados", "Pronto"];
 
   return (
-    <div className="au-root">
+    <div className="au-root" style={mostrarFaixa ? { paddingBottom: 74 } : undefined}>
       <style>{CSS}</style>
 
       <div className="au-top">
@@ -1149,6 +1199,14 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {mostrarFaixa && (
+        <FaixaInstalar
+          iOS={instalacao.iOS}
+          onInstalar={instalacao.instalar}
+          onDispensar={instalacao.dispensar}
+        />
       )}
     </div>
   );
