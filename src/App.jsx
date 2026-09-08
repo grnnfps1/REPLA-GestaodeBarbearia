@@ -755,14 +755,41 @@ const CSS = `
 .au-appt-meta { font-size: 12.5px; color: var(--taupe); margin-top: 3px; }
 .au-badge { font-size: 11px; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
 .au-badge.ok { color: #a8d5a0; background: rgba(120,190,110,0.12); border: 1px solid rgba(120,190,110,0.25); }
-.au-badge.pend { color: var(--gold-soft); background: rgba(201,163,91,0.1); border: 1px solid var(--line); }
+/* Terracota em vez de vermelho: sinaliza sem brigar com o espresso/dourado.
+   Substituiu o antigo .pend — com o CHECK de status no banco só existem
+   'confirmado' e 'cancelado', então não há mais o que ficar pendente. */
+.au-badge.canc { color: #e0a183; background: rgba(201,120,91,0.12); border: 1px solid rgba(201,120,91,0.3); }
+
+/* Cancelado continua na lista, porque o dono quer o histórico do dia —
+   mas recuado, para não competir com o que ainda vai acontecer. */
+.au-appt.cancelado { opacity: .55; }
+.au-appt.cancelado .au-appt-client,
+.au-appt.cancelado .au-appt-valor { text-decoration: line-through; }
+
+/* Selo e botão empilhados à direita no desktop; viram lado a lado no
+   celular (ver a media query no fim do bloco). */
+.au-appt-acoes { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.au-btn-cancel {
+  font-size: 11.5px; padding: 8px 13px; min-height: 34px; border-radius: 999px;
+  background: transparent; border: 1px solid var(--line); color: var(--taupe);
+  cursor: pointer; font-family: inherit; white-space: nowrap;
+  transition: border-color .2s, color .2s;
+}
+.au-btn-cancel:hover { border-color: #c9785b; color: #e0a183; }
+.au-btn-cancel:disabled { opacity: .5; cursor: not-allowed; }
 
 .au-note { color: var(--taupe); font-size: 14px; line-height: 1.6; padding: 18px 6px; }
 .au-note.err { color: var(--gold-soft); }
 
 @media (max-width: 520px){
   .au-appt { grid-template-columns: 60px 1fr; }
-  .au-appt .au-badge { grid-column: 2; justify-self: start; margin-top: 4px; }
+  /* O alvo agora é o grupo, não o selo: ele virou o terceiro filho do grid.
+     Deitado, selo e botão ficam lado a lado embaixo do cliente, sem espremer
+     a coluna do meio. */
+  .au-appt .au-appt-acoes {
+    grid-column: 2; justify-self: start; margin-top: 8px;
+    flex-direction: row; align-items: center;
+  }
 }
 `;
 
@@ -803,6 +830,10 @@ export default function App() {
   // Gravação do agendamento: saving trava o botão, bookingError mostra o aviso.
   const [saving, setSaving] = useState(false);
   const [bookingError, setBookingError] = useState(null);
+
+  // Cancelamento: id em andamento (trava o botão daquele card) e o aviso.
+  const [cancelandoId, setCancelandoId] = useState(null);
+  const [cancelarErro, setCancelarErro] = useState(null);
 
   // Agenda real da área de gestão (só carrega para quem está logado).
   const [appts, setAppts] = useState([]);
@@ -1249,12 +1280,64 @@ export default function App() {
   const doDia = (lista) =>
     !filtroDataAtiva ? lista : lista.filter((a) => chaveDiaBR(a.data_hora) === filtroData);
 
+  // Cancelar é "soft delete": marca status = 'cancelado' e a linha fica. O
+  // histórico do dia continua visível, e o horário volta a ficar livre sozinho
+  // — a trava do banco e a função horarios_ocupados já ignoram cancelado.
+  //
+  // Vai direto na tabela, sem rpc: o banco só concede UPDATE da coluna status
+  // ao papel logado, então nada além do status pode mudar por este caminho.
+  async function cancelarAgendamento(a) {
+    if (cancelandoId) return;
+
+    const pergunta = `Tem certeza que deseja cancelar o agendamento de ${a.cliente_nome} às ${formatHoraBR(a.data_hora)}?`;
+    if (!window.confirm(pergunta)) return;
+
+    setCancelandoId(a.id);
+    setCancelarErro(null);
+
+    // count: "exact" não é zelo excessivo. Um UPDATE barrado pelo RLS não dá
+    // erro — ele simplesmente não casa com nenhuma linha e volta "sucesso"
+    // com zero alterações. Sem conferir a contagem, uma sessão expirada
+    // mostraria o agendamento como cancelado na tela sem nada ter mudado no
+    // banco, e o dono contaria com uma vaga que continua ocupada.
+    const { error, count } = await supabase
+      .from("appointments")
+      .update({ status: "cancelado" }, { count: "exact" })
+      .eq("id", a.id);
+
+    setCancelandoId(null);
+
+    if (error || count === 0) {
+      setCancelarErro(
+        count === 0
+          ? "Não foi possível cancelar. Talvez sua sessão tenha expirado — entre de novo e tente."
+          : "Não conseguimos cancelar agora. Tente de novo em alguns instantes."
+      );
+      return;
+    }
+
+    // Atualiza as duas listas em memória. Recarregar só a agenda do dia não
+    // bastaria: o histórico é baixado uma vez por sessão e é dele que saem a
+    // busca por telefone e o filtro de data passada.
+    const marcar = (lista) =>
+      lista?.map((x) => (x.id === a.id ? { ...x, status: "cancelado" } : x)) ?? lista;
+
+    setAppts(marcar);
+    setHistorico(marcar);
+  }
+
   // Os números do topo acompanham barbeiro e data selecionados, para não
   // contradizerem a lista logo abaixo. A busca por telefone não entra: ela é
   // uma consulta pontual, não uma visão da agenda.
   const apptsDoFiltro = doBarbeiro(doDia(filtroDataPassada ? (historico ?? []) : appts));
-  const faturamentoPrevisto = apptsDoFiltro.reduce((soma, a) => soma + totalDoAppt(a), 0);
-  const aguardandoConfirmacao = apptsDoFiltro.filter((a) => a.status !== "confirmado").length;
+
+  // Cancelado aparece na LISTA (o dono quer ver o histórico do dia) mas fica
+  // fora dos NÚMEROS: não ocupa cadeira, não vira dinheiro e não é trabalho a
+  // fazer. Somar os dois grupos junto faria o topo contradizer a realidade.
+  const confirmadosDoFiltro = apptsDoFiltro.filter((a) => a.status === "confirmado");
+  const canceladosDoFiltro = apptsDoFiltro.filter((a) => a.status === "cancelado");
+
+  const faturamentoPrevisto = confirmadosDoFiltro.reduce((soma, a) => soma + totalDoAppt(a), 0);
 
   // A lista aplica os três filtros em sequência: telefone, data e barbeiro.
   const listaExibida = doBarbeiro(
@@ -1520,9 +1603,9 @@ export default function App() {
             ) : (
               <>
             <div className="au-stats">
-              <div className="au-stat"><div className="n">{apptsDoFiltro.length}</div><div className="l">{filtroDataAtiva ? "Agendamentos no dia" : "Próximos agendamentos"}</div></div>
-              <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">{filtroDataPassada ? "Faturamento do dia" : "Faturamento previsto"}</div></div>
-              <div className="au-stat"><div className="n">{aguardandoConfirmacao}</div><div className="l">Aguardando confirmação</div></div>
+              <div className="au-stat"><div className="n">{confirmadosDoFiltro.length}</div><div className="l">{filtroDataAtiva ? "Agendamentos no dia" : "Próximos agendamentos"}</div></div>
+              <div className="au-stat"><div className="n">R$ {precoBR(faturamentoPrevisto)}</div><div className="l">{filtroDataPassada ? "Faturamento do dia" : "Faturamento previsto"}</div></div>
+              <div className="au-stat"><div className="n">{canceladosDoFiltro.length}</div><div className="l">Cancelados</div></div>
               <div className="au-stat"><div className="n">{barbers.length}</div><div className="l">Barbeiros ativos</div></div>
             </div>
             <div className="au-chips">
@@ -1564,6 +1647,7 @@ export default function App() {
 
             {apptsError && <div className="au-note err">Não foi possível carregar a agenda: {apptsError}</div>}
             {histError && <div className="au-note err">Não foi possível buscar o histórico: {histError}</div>}
+            {cancelarErro && <div className="au-alert">{cancelarErro}</div>}
             <div className="au-appts">
               {listaCarregando ? (
                 <div className="au-note" style={{ padding: "22px" }}>{buscando ? "Buscando…" : "Carregando agenda…"}</div>
@@ -1578,7 +1662,7 @@ export default function App() {
               ) : listaExibida.map((a) => {
                 const fim = fimHoraBR(a);
                 return (
-                <div className="au-appt" key={a.id}>
+                <div className={`au-appt ${a.status === "cancelado" ? "cancelado" : ""}`} key={a.id}>
                   <div>
                     <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
                     {/* Sem duração confiável, mostra só o início — como antes. */}
@@ -1597,7 +1681,19 @@ export default function App() {
                       {[nomesDosServicos(a), a.barbers?.nome, a.cliente_telefone].filter(Boolean).join(" · ")}
                     </div>
                   </div>
-                  <span className={`au-badge ${a.status === "confirmado" ? "ok" : "pend"}`}>{a.status}</span>
+                  <div className="au-appt-acoes">
+                    <span className={`au-badge ${a.status === "cancelado" ? "canc" : "ok"}`}>{a.status}</span>
+                    {/* Já cancelado não mostra o botão: não há o que desfazer por aqui. */}
+                    {a.status !== "cancelado" && (
+                      <button
+                        className="au-btn-cancel"
+                        disabled={cancelandoId === a.id}
+                        onClick={() => cancelarAgendamento(a)}
+                      >
+                        {cancelandoId === a.id ? "Cancelando…" : "Cancelar"}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 );
               })}
