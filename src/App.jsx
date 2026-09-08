@@ -79,6 +79,31 @@ function nomesDosServicos(appt) {
   return (appt.services ?? []).map((s) => s.nome).join(" + ");
 }
 
+// Hora em que o atendimento termina, "HH:MM" no fuso fixo da barbearia.
+// Espelha a função fim_do_atendimento do banco: início + duração em minutos.
+//
+// Devolve null quando não dá para saber. duracao_min é NOT NULL desde a
+// Parte 3.1, então isto é cinto de segurança — mas note que aqui o certo é
+// OMITIR, e não chutar 30 min como o cálculo de horários faz: lá um chute a
+// menos liberaria horário ocupado, aqui um chute errado faria o dono planejar
+// o dia em cima de um fim que não é verdade.
+function fimHoraBR(appt) {
+  const minutos = Number(appt.duracao_min);
+  if (!Number.isFinite(minutos) || minutos <= 0) return null;
+
+  // O !appt.data_hora não é redundante com o isNaN abaixo: new Date(null)
+  // não dá data inválida, dá a época de 1970 — e o card exibiria um fim
+  // inventado em vez de omitir.
+  if (!appt.data_hora) return null;
+
+  const inicio = new Date(appt.data_hora);
+  // Data inválida daria NaN e faria o toISOString abaixo lançar, derrubando
+  // a agenda inteira por causa de uma linha ruim.
+  if (Number.isNaN(inicio.getTime())) return null;
+
+  return formatHoraBR(new Date(inicio.getTime() + minutos * 60000).toISOString());
+}
+
 // Number() protege caso o preço venha como texto do banco.
 function totalDoAppt(appt) {
   return (appt.services ?? []).reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
@@ -721,6 +746,10 @@ const CSS = `
 /* Valor do atendimento, logo abaixo do horário. Mora na coluna de 76px que
    já existe, então não disputa largura com o texto do meio nem com o selo de
    status — é o que manteria o card inteiro no lugar em tela estreita. */
+/* Fim do atendimento, discreto sob o horário de início. "até 11:10" a 11.5px
+   ocupa ~52px, dentro dos 76px da coluna — nada de largura é tirado do texto
+   do meio nem do selo de status. */
+.au-appt-fim { font-size: 11.5px; color: var(--taupe); margin-top: 1px; white-space: nowrap; }
 .au-appt-valor { font-size: 12px; color: var(--gold-soft); margin-top: 2px; white-space: nowrap; }
 .au-appt-client { font-size: 15px; font-weight: 600; color: var(--cream); }
 .au-appt-meta { font-size: 12.5px; color: var(--taupe); margin-top: 3px; }
@@ -1546,10 +1575,14 @@ export default function App() {
                       ? "Nenhum agendamento para esses filtros."
                       : "Nenhum agendamento por aqui ainda."}
                 </div>
-              ) : listaExibida.map((a) => (
+              ) : listaExibida.map((a) => {
+                const fim = fimHoraBR(a);
+                return (
                 <div className="au-appt" key={a.id}>
                   <div>
                     <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
+                    {/* Sem duração confiável, mostra só o início — como antes. */}
+                    {fim && <div className="au-appt-fim">até {fim}</div>}
                     {/* Sem serviços na tabela de ligação não há valor a mostrar:
                         melhor omitir do que exibir um "R$ 0,00" enganoso. */}
                     {a.services?.length > 0 && (
@@ -1566,7 +1599,8 @@ export default function App() {
                   </div>
                   <span className={`au-badge ${a.status === "confirmado" ? "ok" : "pend"}`}>{a.status}</span>
                 </div>
-              ))}
+                );
+              })}
             </div>
               </>
             )}
