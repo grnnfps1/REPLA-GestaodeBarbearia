@@ -68,6 +68,25 @@ function precoBR(valor) {
   });
 }
 
+// Valor cheio para a área de gestão, sempre com centavos: "R$ 91,00". No app
+// do cliente usamos precoBR, que omite o ",00" de propósito — lá o preço é
+// uma etiqueta de cardápio, aqui é dinheiro sendo conferido.
+function moedaBR(valor) {
+  return valor.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+// A agenda lê os serviços pela tabela de ligação, então cada agendamento vem
+// com uma LISTA. Estas duas funções são o único ponto do código que precisa
+// conhecer esse formato.
+function nomesDosServicos(appt) {
+  return (appt.services ?? []).map((s) => s.nome).join(" + ");
+}
+
+// Number() protege caso o preço venha como texto do banco.
+function totalDoAppt(appt) {
+  return (appt.services ?? []).reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
+}
+
 function novoId() {
   if (crypto.randomUUID) return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -687,6 +706,10 @@ const CSS = `
 .au-appt { display: grid; grid-template-columns: 76px 1fr auto; align-items: center; gap: 16px; padding: 18px 22px; border-bottom: 1px solid var(--line-soft); }
 .au-appt:last-child { border-bottom: 0; }
 .au-appt-time { font-family: 'Fraunces', serif; font-size: 22px; color: var(--cream); }
+/* Valor do atendimento, logo abaixo do horário. Mora na coluna de 76px que
+   já existe, então não disputa largura com o texto do meio nem com o selo de
+   status — é o que manteria o card inteiro no lugar em tela estreita. */
+.au-appt-valor { font-size: 12px; color: var(--gold-soft); margin-top: 2px; white-space: nowrap; }
 .au-appt-client { font-size: 15px; font-weight: 600; color: var(--cream); }
 .au-appt-meta { font-size: 12.5px; color: var(--taupe); margin-top: 3px; }
 .au-badge { font-size: 11px; padding: 5px 11px; border-radius: 999px; white-space: nowrap; }
@@ -800,10 +823,13 @@ export default function App() {
 
     ultimaCargaRef.current = Date.now();
 
-    // O JOIN traz o nome do barbeiro e nome+preço do serviço numa só ida.
+    // O JOIN traz o nome do barbeiro e nome+preço de TODOS os serviços numa
+    // só ida. O "!appointment_services" é obrigatório: existem dois caminhos
+    // de appointments até services (a coluna antiga service_id e a tabela de
+    // ligação), e sem dizer qual usar o Supabase recusa a consulta.
     const { data, error } = await supabase
       .from("appointments")
-      .select("*, barbers(nome), services(nome, preco)")
+      .select("*, barbers(nome), services!appointment_services(nome, preco)")
       .gte("data_hora", inicioDoDiaBR())
       .order("data_hora", { ascending: true });
 
@@ -859,7 +885,7 @@ export default function App() {
 
       const { data, error } = await supabase
         .from("appointments")
-        .select("*, barbers(nome), services(nome, preco)")
+        .select("*, barbers(nome), services!appointment_services(nome, preco)")
         .order("data_hora", { ascending: false })
         .limit(2000);
 
@@ -1126,8 +1152,7 @@ export default function App() {
   // contradizerem a lista logo abaixo. A busca por telefone não entra: ela é
   // uma consulta pontual, não uma visão da agenda.
   const apptsDoFiltro = doBarbeiro(doDia(filtroDataPassada ? (historico ?? []) : appts));
-  // Number() protege caso o preço venha como texto do banco.
-  const faturamentoPrevisto = apptsDoFiltro.reduce((soma, a) => soma + Number(a.services?.preco ?? 0), 0);
+  const faturamentoPrevisto = apptsDoFiltro.reduce((soma, a) => soma + totalDoAppt(a), 0);
   const aguardandoConfirmacao = apptsDoFiltro.filter((a) => a.status !== "confirmado").length;
 
   // A lista aplica os três filtros em sequência: telefone, data e barbeiro.
@@ -1488,12 +1513,20 @@ export default function App() {
                 </div>
               ) : listaExibida.map((a) => (
                 <div className="au-appt" key={a.id}>
-                  <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
+                  <div>
+                    <div className="au-appt-time au-serif">{formatHoraBR(a.data_hora)}</div>
+                    {/* Sem serviços na tabela de ligação não há valor a mostrar:
+                        melhor omitir do que exibir um "R$ 0,00" enganoso. */}
+                    {a.services?.length > 0 && (
+                      <div className="au-appt-valor">{moedaBR(totalDoAppt(a))}</div>
+                    )}
+                  </div>
                   <div>
                     <div className="au-appt-client">{a.cliente_nome}</div>
                     <div className="au-appt-meta">
                       {chaveDiaBR(a.data_hora) !== hojeBR && `${formatDiaCurtoBR(a.data_hora)} · `}
-                      {a.services?.nome} · {a.barbers?.nome} · {a.cliente_telefone}
+                      {/* filter(Boolean) evita " · " solto se algum pedaço faltar. */}
+                      {[nomesDosServicos(a), a.barbers?.nome, a.cliente_telefone].filter(Boolean).join(" · ")}
                     </div>
                   </div>
                   <span className={`au-badge ${a.status === "confirmado" ? "ok" : "pend"}`}>{a.status}</span>
