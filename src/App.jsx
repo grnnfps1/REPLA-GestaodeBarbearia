@@ -64,6 +64,59 @@ function mapService(row) {
   };
 }
 
+function mapPortfolio(row) {
+  return {
+    id: row.id,
+    path: row.path,
+    url: row.url,
+  };
+}
+
+// Nome do bucket público criado no painel do Supabase (Storage → New bucket).
+const BUCKET_PORTFOLIO = "portfolio";
+
+// Reduz a foto ANTES de subir: no máximo 1600px no maior lado, JPEG de
+// qualidade 0.82. Uma foto de celular de ~4 MB costuma virar ~250 KB — a
+// galeria abre rápido no 4G e o plano gratuito de storage dura muito mais.
+const MAX_LADO_PX = 1600;
+// Trave de segurança para o arquivo ORIGINAL: acima disso nem tentamos abrir
+// a imagem, para não travar o celular do dono.
+const MAX_BYTES_ORIGINAL = 25 * 1024 * 1024;
+
+function formatarMB(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function comprimirImagem(arquivo) {
+  try {
+    const bitmap = await createImageBitmap(arquivo);
+    const escala = Math.min(1, MAX_LADO_PX / Math.max(bitmap.width, bitmap.height));
+    const largura = Math.round(bitmap.width * escala);
+    const altura = Math.round(bitmap.height * escala);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = largura;
+    canvas.height = altura;
+    const ctx = canvas.getContext("2d");
+    // JPEG não tem transparência: sem este fundo, um PNG transparente
+    // sairia com manchas pretas.
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, largura, altura);
+    ctx.drawImage(bitmap, 0, 0, largura, altura);
+    bitmap.close?.();
+
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.82));
+    // Se o "comprimido" ficou maior que o original (acontece com imagens
+    // pequenas), o original é a melhor escolha.
+    if (blob && blob.size < arquivo.size) return { blob, ext: "jpg" };
+  } catch {
+    // Navegador sem createImageBitmap/canvas: sobe o arquivo original.
+  }
+
+  const ext = (arquivo.name.split(".").pop() || "jpg").toLowerCase().slice(0, 5);
+  return { blob: arquivo, ext };
+}
+
 
 const WEEKDAYS = ["dom", "seg", "ter", "qua", "qui", "sex", "sáb"];
 const MONTHS = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
@@ -342,6 +395,32 @@ const CSS = `
 .au-sprice { font-family: 'Fraunces', serif; font-size: 24px; color: var(--gold-soft); }
 .au-smin { color: var(--taupe); font-size: 12px; margin-top: 2px; }
 
+/* Mural de fotos. Duas colunas no celular, e quantas couberem daí para
+   cima — sem media query, o próprio auto-fill se encarrega. */
+.au-gal { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+@media (min-width: 720px){ .au-gal { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; } }
+.au-gal-item {
+  position: relative; aspect-ratio: 1/1; overflow: hidden;
+  border-radius: 14px; border: 1px solid var(--line-soft);
+  background: var(--surface);
+}
+.au-gal-item img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .4s ease; }
+.au-gal-item:hover img { transform: scale(1.04); }
+.au-gal-item:hover { border-color: var(--gold); }
+
+/* Botão de apagar: sempre visível (não depende de hover, que não existe
+   no celular) e com 36px de alvo para o dedo. */
+.au-gal-del {
+  position: absolute; top: 8px; right: 8px;
+  width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center; cursor: pointer;
+  background: rgba(15,12,10,0.8); border: 1px solid var(--line);
+  color: var(--cream); font-size: 14px; line-height: 1; font-family: inherit;
+  backdrop-filter: blur(4px);
+}
+.au-gal-del:hover { border-color: var(--gold); color: var(--gold-soft); }
+.au-gal-del:disabled { opacity: .5; cursor: not-allowed; }
+
 .au-foot { border-top: 1px solid var(--line-soft); padding: 46px 24px; text-align: center; color: var(--taupe); font-size: 13px; }
 .au-foot .au-mark { justify-content: center; margin-bottom: 16px; }
 
@@ -421,6 +500,34 @@ const CSS = `
 .au-dash-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
 .au-dash-head h2 { font-family: 'Fraunces', serif; font-size: 34px; color: var(--cream); }
 .au-dash-date { color: var(--gold); font-size: 13px; letter-spacing: .04em; }
+/* Abas da área de gestão (Agenda / Trabalhos). */
+.au-tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--line-soft); margin: 20px 0 8px; }
+.au-tab {
+  cursor: pointer; font-family: inherit; font-size: 14px; font-weight: 500;
+  background: transparent; border: 0; color: var(--taupe);
+  padding: 12px 16px; min-height: 44px;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color .2s, border-color .2s;
+}
+.au-tab:hover { color: var(--cream); }
+.au-tab.on { color: var(--gold-soft); border-bottom-color: var(--gold); font-weight: 600; }
+
+/* Área de upload: o label inteiro é o botão, então o alvo de toque é
+   enorme no celular. O input de arquivo fica escondido dentro dele. */
+.au-upload {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: 6px; cursor: pointer; margin: 22px 0 24px;
+  padding: 28px 20px; border-radius: 18px;
+  border: 1px dashed var(--line); background: rgba(201,163,91,0.04);
+  transition: border-color .2s, background .2s;
+}
+.au-upload:hover { border-color: var(--gold); background: rgba(201,163,91,0.08); }
+.au-upload:has(input:disabled) { cursor: progress; opacity: .75; }
+.au-upload input { display: none; }
+.au-upload-icon { font-size: 26px; color: var(--gold); line-height: 1; }
+.au-upload-t { font-size: 15px; font-weight: 600; color: var(--cream); }
+.au-upload-s { font-size: 12.5px; color: var(--taupe); line-height: 1.5; max-width: 380px; }
+
 .au-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 14px; margin: 26px 0 34px; }
 .au-stat { background: linear-gradient(180deg, var(--surface), var(--espresso-2)); border: 1px solid var(--line-soft); border-radius: 16px; padding: 20px; }
 .au-stat .n { font-family: 'Fraunces', serif; font-size: 34px; color: var(--gold-soft); line-height: 1; }
@@ -518,6 +625,15 @@ export default function App() {
   const [services, setServices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
+
+  // Mural de fotos: leitura é pública, então carrega junto com o resto da home.
+  const [portfolio, setPortfolio] = useState([]);
+  // Área de gestão: aba atual ("agenda" ou "trabalhos") e estado do upload.
+  const [aba, setAba] = useState("agenda");
+  const [enviando, setEnviando] = useState(null);
+  const [portfolioError, setPortfolioError] = useState(null);
+  const [apagandoId, setApagandoId] = useState(null);
+  const inputFotosRef = useRef(null);
 
   // Gravação do agendamento: saving trava o botão, bookingError mostra o aviso.
   const [saving, setSaving] = useState(false);
@@ -689,18 +805,38 @@ export default function App() {
     setBusca("");
     setFiltroBarbeiro("todos");
     setFiltroData("proximos");
+    setAba("agenda");
+    setPortfolioError(null);
     // Volta ao estado de "primeira carga" para o próximo login.
     setApptsLoading(true);
   }
+
+  // Recarrega o mural. Fica separado porque também roda depois de cada
+  // upload e de cada exclusão na área de gestão.
+  const loadPortfolio = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("portfolio_items")
+      .select("*")
+      .order("criado_em", { ascending: false });
+
+    if (error) {
+      // Na home isso é silencioso: sem fotos, a seção simplesmente não aparece.
+      setPortfolioError(error.message);
+      return;
+    }
+    setPortfolio(data.map(mapPortfolio));
+    setPortfolioError(null);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
-      // As duas buscas vão juntas para a tela abrir mais rápido.
+      // As três buscas vão juntas para a tela abrir mais rápido.
       const [barbersRes, servicesRes] = await Promise.all([
         supabase.from("barbers").select("*").eq("ativo", true).order("criado_em"),
         supabase.from("services").select("*").eq("ativo", true).order("criado_em"),
+        loadPortfolio(),
       ]);
 
       if (cancelled) return;
@@ -717,7 +853,90 @@ export default function App() {
 
     load();
     return () => { cancelled = true; };
-  }, []);
+  }, [loadPortfolio]);
+
+  // Sobe uma ou várias fotos: comprime, manda para o bucket e registra a
+  // linha no banco. Uma foto que falha não impede as outras de subirem.
+  async function handleUploadFotos(lista) {
+    const arquivos = Array.from(lista || []).filter((f) => f.type.startsWith("image/"));
+    if (arquivos.length === 0) return;
+
+    setPortfolioError(null);
+    const falhas = [];
+
+    for (let i = 0; i < arquivos.length; i++) {
+      const arquivo = arquivos[i];
+      setEnviando({ atual: i + 1, total: arquivos.length });
+
+      if (arquivo.size > MAX_BYTES_ORIGINAL) {
+        falhas.push(`${arquivo.name} (${formatarMB(arquivo.size)} — máximo ${formatarMB(MAX_BYTES_ORIGINAL)})`);
+        continue;
+      }
+
+      const { blob, ext } = await comprimirImagem(arquivo);
+      // Nome único: sem isso, duas fotos com o mesmo nome se sobrescreveriam.
+      const path = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}.${ext}`;
+
+      const { error: upErro } = await supabase.storage
+        .from(BUCKET_PORTFOLIO)
+        .upload(path, blob, { contentType: blob.type || "image/jpeg", cacheControl: "31536000" });
+
+      if (upErro) {
+        falhas.push(arquivo.name);
+        continue;
+      }
+
+      const url = supabase.storage.from(BUCKET_PORTFOLIO).getPublicUrl(path).data.publicUrl;
+      const { error: dbErro } = await supabase.from("portfolio_items").insert({ path, url });
+
+      if (dbErro) {
+        // O registro falhou: tira o arquivo do storage para não ficar lixo
+        // invisível ocupando espaço.
+        await supabase.storage.from(BUCKET_PORTFOLIO).remove([path]);
+        falhas.push(arquivo.name);
+      }
+    }
+
+    setEnviando(null);
+    // Limpa o input para que escolher a MESMA foto de novo dispare o onChange.
+    if (inputFotosRef.current) inputFotosRef.current.value = "";
+
+    if (falhas.length > 0) {
+      setPortfolioError(
+        falhas.length === arquivos.length
+          ? `Não conseguimos enviar: ${falhas.join(", ")}. Confira sua conexão e tente de novo.`
+          : `Algumas fotos não subiram: ${falhas.join(", ")}. As demais foram enviadas.`
+      );
+    }
+
+    await loadPortfolio();
+  }
+
+  // Apaga primeiro do storage e só então do banco: se a ordem fosse a
+  // inversa e a segunda parte falhasse, o arquivo ficaria órfão sem
+  // ninguém para encontrá-lo.
+  async function handleApagarFoto(item) {
+    if (apagandoId) return;
+    if (!window.confirm("Apagar esta foto do mural? Isso não pode ser desfeito.")) return;
+
+    setApagandoId(item.id);
+    setPortfolioError(null);
+
+    const { error: stErro } = await supabase.storage.from(BUCKET_PORTFOLIO).remove([item.path]);
+    if (stErro) {
+      setPortfolioError("Não conseguimos apagar a foto agora. Tente de novo em instantes.");
+      setApagandoId(null);
+      return;
+    }
+
+    const { error: dbErro } = await supabase.from("portfolio_items").delete().eq("id", item.id);
+    if (dbErro) {
+      setPortfolioError("A foto foi removida, mas o registro não. Recarregue a página e tente de novo.");
+    }
+
+    setApagandoId(null);
+    await loadPortfolio();
+  }
 
   // Trava o fundo enquanto o modal de agendamento está aberto. Depende do
   // booleano, não do objeto booking — senão a trava se refaria a cada tecla
@@ -898,6 +1117,47 @@ export default function App() {
 
           <section className="au-sec">
             <div className="au-sec-head">
+              <h2 className="au-serif">Serviços</h2>
+              <p>Preços justos, tempo reservado só para você. Sem fila, sem espera.</p>
+            </div>
+            {loading && <div className="au-note">Carregando serviços…</div>}
+            <div className="au-menu">
+              {services.map((s) => (
+                <div className="au-srow" key={s.id}>
+                  <div>
+                    <div className="au-sname au-serif">{s.nome}</div>
+                    <div className="au-sdesc">{s.descricao}</div>
+                  </div>
+                  <div className="au-smeta">
+                    <div className="au-sprice au-serif">R$ {s.preco}</div>
+                    <div className="au-smin">{s.duracao_min} min</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ textAlign: "center", marginTop: 40 }}>
+              <button className="au-btn" onClick={() => startBooking()}>Reservar meu horário</button>
+            </div>
+          </section>
+
+          {portfolio.length > 0 && (
+            <section className="au-sec" style={{ paddingTop: 0 }}>
+              <div className="au-sec-head">
+                <h2 className="au-serif">Nossos trabalhos</h2>
+                <p>Alguns cortes que saíram daqui. O próximo pode ser o seu.</p>
+              </div>
+              <div className="au-gal">
+                {portfolio.map((p) => (
+                  <figure className="au-gal-item" key={p.id}>
+                    <img src={p.url} alt="Corte feito na Áurea Barbearia" loading="lazy" />
+                  </figure>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <section className="au-sec" style={{ paddingTop: 0 }}>
+            <div className="au-sec-head">
               <h2 className="au-serif">Nossa equipe</h2>
               <p>Cada profissional tem sua assinatura. Escolha por estilo — ou por quem já é seu barbeiro de confiança.</p>
             </div>
@@ -924,31 +1184,6 @@ export default function App() {
                   </div>
                 </article>
               ))}
-            </div>
-          </section>
-
-          <section className="au-sec" style={{ paddingTop: 0 }}>
-            <div className="au-sec-head">
-              <h2 className="au-serif">Serviços</h2>
-              <p>Preços justos, tempo reservado só para você. Sem fila, sem espera.</p>
-            </div>
-            {loading && <div className="au-note">Carregando serviços…</div>}
-            <div className="au-menu">
-              {services.map((s) => (
-                <div className="au-srow" key={s.id}>
-                  <div>
-                    <div className="au-sname au-serif">{s.nome}</div>
-                    <div className="au-sdesc">{s.descricao}</div>
-                  </div>
-                  <div className="au-smeta">
-                    <div className="au-sprice au-serif">R$ {s.preco}</div>
-                    <div className="au-smin">{s.duracao_min} min</div>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div style={{ textAlign: "center", marginTop: 40 }}>
-              <button className="au-btn" onClick={() => startBooking()}>Reservar meu horário</button>
             </div>
           </section>
 
@@ -979,9 +1214,61 @@ export default function App() {
         ) : (
           <div className="au-dash">
             <div className="au-dash-head">
-              <h2 className="au-serif">Agenda</h2>
-              <div className="au-dash-date">{WEEKDAYS[new Date().getDay()].toUpperCase()}, {new Date().getDate()} {MONTHS[new Date().getMonth()].toUpperCase()}</div>
+              <h2 className="au-serif">{aba === "agenda" ? "Agenda" : "Trabalhos"}</h2>
+              {aba === "agenda" && (
+                <div className="au-dash-date">{WEEKDAYS[new Date().getDay()].toUpperCase()}, {new Date().getDate()} {MONTHS[new Date().getMonth()].toUpperCase()}</div>
+              )}
             </div>
+
+            <div className="au-tabs">
+              <button className={`au-tab ${aba === "agenda" ? "on" : ""}`} onClick={() => setAba("agenda")}>Agenda</button>
+              <button className={`au-tab ${aba === "trabalhos" ? "on" : ""}`} onClick={() => setAba("trabalhos")}>Trabalhos</button>
+            </div>
+
+            {aba === "trabalhos" ? (
+              <>
+                <label className="au-upload">
+                  <input
+                    ref={inputFotosRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    disabled={enviando !== null}
+                    onChange={(e) => handleUploadFotos(e.target.files)}
+                  />
+                  <span className="au-upload-icon">＋</span>
+                  <span className="au-upload-t">{enviando ? `Enviando ${enviando.atual} de ${enviando.total}…` : "Adicionar fotos"}</span>
+                  <span className="au-upload-s">
+                    {enviando
+                      ? "Não feche esta tela."
+                      : `Só imagens. Elas são reduzidas automaticamente antes de subir (máx. ${formatarMB(MAX_BYTES_ORIGINAL)} por foto).`}
+                  </span>
+                </label>
+
+                {portfolioError && <div className="au-note err">{portfolioError}</div>}
+
+                {portfolio.length === 0 ? (
+                  <div className="au-note">Nenhuma foto no mural ainda. As que você enviar aparecem na home, na seção “Nossos trabalhos”.</div>
+                ) : (
+                  <div className="au-gal">
+                    {portfolio.map((p) => (
+                      <figure className="au-gal-item" key={p.id}>
+                        <img src={p.url} alt="" loading="lazy" />
+                        <button
+                          className="au-gal-del"
+                          aria-label="Apagar foto"
+                          disabled={apagandoId !== null}
+                          onClick={() => handleApagarFoto(p)}
+                        >
+                          {apagandoId === p.id ? "…" : "✕"}
+                        </button>
+                      </figure>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
             <div className="au-stats">
               <div className="au-stat"><div className="n">{apptsDoFiltro.length}</div><div className="l">{filtroDataAtiva ? "Agendamentos no dia" : "Próximos agendamentos"}</div></div>
               <div className="au-stat"><div className="n">R$ {faturamentoPrevisto.toLocaleString("pt-BR")}</div><div className="l">{filtroDataPassada ? "Faturamento do dia" : "Faturamento previsto"}</div></div>
@@ -1052,6 +1339,9 @@ export default function App() {
                 </div>
               ))}
             </div>
+              </>
+            )}
+
             <div style={{ textAlign: "center", marginTop: 24 }}>
               <button className="au-btn au-btn-ghost" onClick={handleLogout}>Sair</button>
             </div>
