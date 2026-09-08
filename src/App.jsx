@@ -56,6 +56,28 @@ function mapBarber(row) {
   };
 }
 
+// Um UUID v4 novo, sorteado aqui no navegador. crypto.randomUUID existe em
+// todo navegador atual, mas só em conexão segura (https ou localhost) — o
+// plano B cobre o resto.
+// Soma em reais. Só mostra centavos quando existem: "R$ 90", não "R$ 90,00"
+// — e nunca "R$ 90,5", que é o que o toLocaleString cru devolveria.
+function precoBR(valor) {
+  return valor.toLocaleString("pt-BR", {
+    minimumFractionDigits: Number.isInteger(valor) ? 0 : 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function novoId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // versão 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variante RFC 4122
+  const h = [...bytes].map((x) => x.toString(16).padStart(2, "0"));
+  return [h.slice(0, 4), h.slice(4, 6), h.slice(6, 8), h.slice(8, 10), h.slice(10, 16)]
+    .map((parte) => parte.join("")).join("-");
+}
+
 function mapService(row) {
   return {
     id: row.id,
@@ -498,6 +520,34 @@ const CSS = `
 .au-pick-t { font-size: 15px; font-weight: 600; }
 .au-pick-s { font-size: 12.5px; color: var(--taupe); margin-top: 2px; }
 .au-pick-p { font-family: 'Fraunces', serif; color: var(--gold-soft); font-size: 18px; }
+.au-pick.sel { border-color: var(--gold); background: var(--surface-2); }
+
+/* Caixa de marcação da escolha múltipla de serviços. O ✓ mora sempre no
+   HTML e só ganha cor quando marcado — assim a caixa não muda de tamanho
+   e a lista não "pula" a cada toque. */
+.au-pick-cb {
+  flex: 0 0 auto; width: 24px; height: 24px; border-radius: 7px;
+  border: 1.5px solid var(--line); display: grid; place-items: center;
+  font-size: 13px; line-height: 1; color: transparent;
+  transition: background .2s, border-color .2s, color .2s;
+}
+.au-pick.sel .au-pick-cb { background: var(--gold); border-color: var(--gold); color: #1a1410; }
+
+.au-hint { color: var(--taupe); font-size: 13px; line-height: 1.55; margin: -2px 2px 14px; }
+
+/* Barra de total: gruda no rodapé da folha (que é quem rola) para o preço e
+   o botão ficarem sempre à mão no celular, com a lista rolando por baixo.
+   As margens negativas cancelam o padding da folha para ela encostar nas
+   bordas; a de baixo devolve o respiro da safe-area do iPhone. */
+.au-pickbar {
+  position: sticky; bottom: 0; z-index: 2;
+  margin: 18px -24px calc(-28px - env(safe-area-inset-bottom));
+  padding: 14px 24px calc(16px + env(safe-area-inset-bottom));
+  background: var(--espresso); border-top: 1px solid var(--line-soft);
+}
+.au-pickbar-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.au-pickbar-l { font-size: 12.5px; color: var(--taupe); min-width: 0; }
+.au-pickbar-p { font-family: 'Fraunces', serif; font-size: 22px; color: var(--gold-soft); white-space: nowrap; }
 
 .au-dates { display: flex; gap: 9px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 20px; }
 .au-date { flex: 0 0 auto; width: 62px; text-align: center; cursor: pointer;
@@ -524,8 +574,16 @@ const CSS = `
 .au-field input:focus { outline: none; border-color: var(--gold); }
 
 .au-summary { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 20px; }
-.au-sumrow { display: flex; justify-content: space-between; padding: 7px 0; font-size: 14px; }
-.au-sumrow span:first-child { color: var(--taupe); }
+.au-sumrow { display: flex; justify-content: space-between; gap: 14px; padding: 7px 0; font-size: 14px; }
+/* min-width: 0 deixa nome de serviço comprido quebrar em vez de empurrar o
+   preço para fora da tela no celular. */
+.au-sumrow span:first-child { color: var(--taupe); min-width: 0; }
+.au-sumrow span:last-child { text-align: right; }
+/* Lista de serviços do resumo: nome em destaque, preço discreto — o valor
+   que importa ali é o Total, lá embaixo. */
+.au-sumsvcs { border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); margin: 6px 0; padding: 4px 0; }
+.au-sumrow.svc span:first-child { color: var(--cream); }
+.au-sumrow.svc span:last-child { color: var(--taupe); white-space: nowrap; }
 .au-sumrow.total { border-top: 1px solid var(--line-soft); margin-top: 6px; padding-top: 12px; }
 .au-sumrow.total span:last-child { font-family: 'Fraunces', serif; font-size: 22px; color: var(--gold-soft); }
 
@@ -1086,7 +1144,7 @@ export default function App() {
 
   const startBooking = (barberId = null) => {
     setBookingError(null);
-    setBooking({ step: barberId ? 1 : 0, barber: barberId, service: null, date: 0, time: null, name: "", phone: "" });
+    setBooking({ step: barberId ? 1 : 0, barber: barberId, services: [], date: 0, time: null, name: "", phone: "" });
   };
 
   const closeBooking = () => {
@@ -1098,23 +1156,34 @@ export default function App() {
   const b = booking;
 
   // Grava o agendamento no banco. A tela de sucesso só aparece se der certo.
+  //
+  // São DUAS escritas: a linha em appointments e uma linha por serviço em
+  // appointment_services. O id sai do navegador (novoId) de propósito: o
+  // cliente agenda sem login e não tem permissão de LER appointments, então
+  // não daria para perguntar ao banco qual id ele acabou de criar.
   async function confirmBooking() {
     if (saving) return;
     setSaving(true);
     setBookingError(null);
 
+    const idAgendamento = novoId();
+    const idsServicos = servicosEscolhidos.map((s) => s.id);
+
     const { error } = await supabase.from("appointments").insert({
+      id: idAgendamento,
       barber_id: b.barber,
-      service_id: b.service,
+      // Coluna antiga, ainda obrigatória: recebe o PRIMEIRO serviço da lista
+      // só para não quebrar. Quem manda agora é appointment_services; ela sai
+      // numa próxima parte.
+      service_id: idsServicos[0],
       data_hora: toTimestampBR(days[b.date], b.time),
       cliente_nome: b.name.trim(),
       cliente_telefone: b.phone.trim(),
       status: "confirmado",
     });
 
-    setSaving(false);
-
     if (error) {
+      setSaving(false);
       // 23505 = violação de UNIQUE no Postgres. Aqui só pode ser a constraint
       // (barber_id, data_hora): alguém pegou esse horário primeiro.
       if (error.code === "23505") {
@@ -1126,18 +1195,60 @@ export default function App() {
       return;
     }
 
+    const { error: erroServicos } = await supabase
+      .from("appointment_services")
+      .insert(idsServicos.map((sid) => ({ appointment_id: idAgendamento, service_id: sid })));
+
+    if (erroServicos) {
+      // Segunda escrita falhou. Tenta desfazer a primeira para não deixar o
+      // agendamento pela metade. Só tratamos como desfeito se o banco
+      // confirmar 1 linha apagada — no escuro, avisamos a mais.
+      const { error: erroDesfazer, count } = await supabase
+        .from("appointments")
+        .delete({ count: "exact" })
+        .eq("id", idAgendamento);
+
+      setSaving(false);
+      setBookingError(
+        !erroDesfazer && count === 1
+          ? "Não conseguimos concluir seu agendamento agora. Tente de novo em alguns instantes."
+          : "Seu horário ficou reservado, mas só registramos o primeiro serviço. Chame a gente no WhatsApp para incluir os demais."
+      );
+      return;
+    }
+
+    setSaving(false);
     setBooking({ ...b, step: 4 });
   }
   const barberObj = b?.barber ? barbers.find((x) => x.id === b.barber) : null;
-  const serviceObj = b?.service ? services.find((x) => x.id === b.service) : null;
   // Quem faz o quê virá da tabela barber_services num próximo passo.
   const availServices = services;
+
+  // Os marcados, na ordem do cardápio e não na ordem dos cliques — assim o
+  // resumo não embaralha a cada toque. Sai do availServices, então serviço
+  // que o barbeiro não faz nunca entra na conta.
+  const servicosEscolhidos = availServices.filter((s) => b?.services?.includes(s.id));
+  const totalPreco = servicosEscolhidos.reduce((soma, s) => soma + Number(s.preco ?? 0), 0);
+  const totalDuracao = servicosEscolhidos.reduce((soma, s) => soma + Number(s.duracao_min ?? 0), 0);
+  const resumoServicos = servicosEscolhidos.map((s) => s.nome.toLowerCase()).join(" + ");
+
+  // Marca/desmarca um serviço. Nenhum horário é recalculado aqui: a duração
+  // só passa a mexer nos horários oferecidos na Parte 3.
+  const toggleService = (id) => {
+    setBookingError(null);
+    setBooking((atual) => ({
+      ...atual,
+      services: atual.services.includes(id)
+        ? atual.services.filter((x) => x !== id)
+        : [...atual.services, id],
+    }));
+  };
 
   // Só libera o "Continuar" se o horário escolhido ainda estiver na lista.
   // Protege o caso de trocar de barbeiro depois de já ter escolhido a hora.
   const horarioSelecionadoValido = Boolean(b?.time && slotsLivres.includes(b.time));
 
-  const steps = ["Profissional", "Serviço", "Data e horário", "Seus dados", "Pronto"];
+  const steps = ["Profissional", "Serviços", "Data e horário", "Seus dados", "Pronto"];
 
   return (
     <div className="au-root" style={mostrarFaixa ? { paddingBottom: 74 } : undefined}>
@@ -1413,7 +1524,7 @@ export default function App() {
               {bookingError && <div className="au-alert">{bookingError}</div>}
 
               {b.step === 0 && barbers.map((bb) => (
-                <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, service: null, time: null, step: 1 })}>
+                <button className="au-pick" key={bb.id} onClick={() => setBooking({ ...b, barber: bb.id, services: [], time: null, step: 1 })}>
                   <img src={bb.foto_url} alt="" />
                   <div className="au-pick-main">
                     <div className="au-pick-t">{bb.nome}</div>
@@ -1422,15 +1533,49 @@ export default function App() {
                 </button>
               ))}
 
-              {b.step === 1 && availServices.map((s) => (
-                <button className="au-pick" key={s.id} onClick={() => setBooking({ ...b, service: s.id, step: 2 })}>
-                  <div className="au-pick-main">
-                    <div className="au-pick-t">{s.nome}</div>
-                    <div className="au-pick-s">{s.duracao_min} min · {s.descricao}</div>
+              {b.step === 1 && (
+                <>
+                  <div className="au-hint">
+                    Marque quantos serviços quiser — todos serão feitos por {barberObj?.nome.split(" ")[0]} no mesmo horário.
                   </div>
-                  <div className="au-pick-p au-serif">R$ {s.preco}</div>
-                </button>
-              ))}
+                  {availServices.map((s) => {
+                    const marcado = b.services.includes(s.id);
+                    return (
+                      <button
+                        className={`au-pick ${marcado ? "sel" : ""}`}
+                        key={s.id}
+                        aria-pressed={marcado}
+                        onClick={() => toggleService(s.id)}
+                      >
+                        <span className="au-pick-cb" aria-hidden="true">✓</span>
+                        <div className="au-pick-main">
+                          <div className="au-pick-t">{s.nome}</div>
+                          <div className="au-pick-s">{s.duracao_min} min · {s.descricao}</div>
+                        </div>
+                        <div className="au-pick-p au-serif">R$ {s.preco}</div>
+                      </button>
+                    );
+                  })}
+                  <div className="au-pickbar">
+                    <div className="au-pickbar-row">
+                      <span className="au-pickbar-l">
+                        {servicosEscolhidos.length === 0
+                          ? "Nenhum serviço marcado"
+                          : `${servicosEscolhidos.length} ${servicosEscolhidos.length === 1 ? "serviço" : "serviços"} · ${totalDuracao} min`}
+                      </span>
+                      <span className="au-pickbar-p">R$ {precoBR(totalPreco)}</span>
+                    </div>
+                    <button
+                      className="au-btn"
+                      style={{ width: "100%", justifyContent: "center" }}
+                      disabled={servicosEscolhidos.length === 0}
+                      onClick={() => setBooking({ ...b, step: 2 })}
+                    >
+                      Continuar
+                    </button>
+                  </div>
+                </>
+              )}
 
               {b.step === 2 && (
                 <>
@@ -1468,9 +1613,14 @@ export default function App() {
                 <>
                   <div className="au-summary">
                     <div className="au-sumrow"><span>Profissional</span><span>{barberObj?.nome}</span></div>
-                    <div className="au-sumrow"><span>Serviço</span><span>{serviceObj?.nome}</span></div>
+                    <div className="au-sumsvcs">
+                      {servicosEscolhidos.map((s) => (
+                        <div className="au-sumrow svc" key={s.id}><span>{s.nome}</span><span>R$ {s.preco}</span></div>
+                      ))}
+                    </div>
                     <div className="au-sumrow"><span>Quando</span><span>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} · {b.time}</span></div>
-                    <div className="au-sumrow total"><span>Total</span><span>R$ {serviceObj?.preco}</span></div>
+                    <div className="au-sumrow"><span>Duração</span><span>{totalDuracao} min</span></div>
+                    <div className="au-sumrow total"><span>Total</span><span>R$ {precoBR(totalPreco)}</span></div>
                   </div>
                   <div className="au-field"><label>Seu nome</label><input value={b.name} onChange={(e) => setBooking({ ...b, name: e.target.value })} placeholder="Como devemos te chamar?" /></div>
                   <div className="au-field"><label>Telefone / WhatsApp</label><input type="tel" inputMode="numeric" autoComplete="tel" value={b.phone} onChange={(e) => setBooking({ ...b, phone: mascaraTelefone(e.target.value) })} placeholder="(21) 90000-0000" /></div>
@@ -1482,7 +1632,7 @@ export default function App() {
                 <div className="au-done">
                   <div className="au-check">✓</div>
                   <h3 className="au-serif">Horário reservado</h3>
-                  <p>{b.name.split(" ")[0]}, seu {serviceObj?.nome.toLowerCase()} com {barberObj?.nome.split(" ")[0]} está marcado para <strong style={{ color: "var(--cream)" }}>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} às {b.time}</strong>. Enviaremos um lembrete no WhatsApp.</p>
+                  <p>{b.name.split(" ")[0]}, seu {resumoServicos} com {barberObj?.nome.split(" ")[0]} está marcado para <strong style={{ color: "var(--cream)" }}>{days[b.date].getDate()} {MONTHS[days[b.date].getMonth()]} às {b.time}</strong>. Enviaremos um lembrete no WhatsApp.</p>
                   <button className="au-btn" style={{ marginTop: 26 }} onClick={closeBooking}>Concluir</button>
                 </div>
               )}
